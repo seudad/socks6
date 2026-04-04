@@ -86,6 +86,12 @@ pub async fn run(config: Config) -> Result<()> {
     }
     if let Some(ref sni) = config.sni_spoof {
         tracing::info!(sni = %sni, "подмена SNI включена");
+        if !config.sni_exclude.is_empty() {
+            tracing::info!(
+                exclude = ?config.sni_exclude,
+                "SNI: исключения (--sni-exclude)"
+            );
+        }
     }
 
     loop {
@@ -141,6 +147,26 @@ pub async fn run(config: Config) -> Result<()> {
     }
 }
 
+/// Подмена SNI только для порта 443 и если имя хоста не попадает под `--sni-exclude`.
+fn effective_sni_spoof<'a>(config: &'a Config, target: &socks5::TargetAddr) -> Option<&'a str> {
+    if target.port() != 443 {
+        return None;
+    }
+    let spoof = config.sni_spoof.as_deref()?;
+    match target {
+        socks5::TargetAddr::Domain(host, _) => {
+            let h = host.to_ascii_lowercase();
+            for p in &config.sni_exclude {
+                if h == *p || h.ends_with(&format!(".{}", p)) {
+                    return None;
+                }
+            }
+            Some(spoof)
+        }
+        socks5::TargetAddr::Ip(_) => Some(spoof),
+    }
+}
+
 #[tracing::instrument(name = "client", skip_all, fields(%peer))]
 async fn handle_client<S>(
     mut client: S,
@@ -171,10 +197,15 @@ where
     socks5::send_connect_ok(&mut client, bind).await?;
 
     let target_label = target.to_string();
+    let sni = effective_sni_spoof(&config, &target);
+
     // #region agent log
     let spoof = config
         .sni_spoof
         .as_deref()
+        .map(|s| format!("\"{}\"", crate::debug_agent::ej(s)))
+        .unwrap_or_else(|| "null".to_string());
+    let eff = sni
         .map(|s| format!("\"{}\"", crate::debug_agent::ej(s)))
         .unwrap_or_else(|| "null".to_string());
     crate::debug_agent::emit(
@@ -184,20 +215,31 @@ where
         "icloud-repro",
         peer,
         &format!(
-            r#""target":"{}","port":{},"sni_spoof":{}"#,
+            r#""target":"{}","port":{},"sni_spoof_config":{},"sni_effective":{}"#,
             crate::debug_agent::ej(&target_label),
             target.port(),
-            spoof
+            spoof,
+            eff
         ),
     );
+    if config.sni_spoof.is_some() && sni.is_none() && target.port() == 443 {
+        if let socks5::TargetAddr::Domain(host, _) = &target {
+            crate::debug_agent::emit(
+                "H1-fix",
+                "server.rs:handle_client",
+                "sni_not_applied",
+                "post-fix",
+                peer,
+                &format!(
+                    r#""host":"{}","reason":"sni_exclude_suffix""#,
+                    crate::debug_agent::ej(host)
+                ),
+            );
+            tracing::info!(%peer, host = %host, "подмена SNI отключена (--sni-exclude)");
+        }
+    }
     // #endregion agent log
 
-    let is_tls = target.port() == 443;
-    let sni = if is_tls {
-        config.sni_spoof.as_deref()
-    } else {
-        None
-    };
     let relay_res = relay::relay(&mut client, &mut remote, sni, peer, &target_label).await;
     // #region agent log
     if let Err(ref e) = relay_res {

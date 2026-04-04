@@ -12,6 +12,8 @@ pub struct Config {
     pub tls_key: Option<String>,
     /// Разрешить на том же порту и plaintext SOCKS5 (первый байт 0x05), и TLS (0x16).
     pub tls_flex: bool,
+    /// Суффиксы домена (например `apple.com`): для `host` на :443 не подменять SNI.
+    pub sni_exclude: Vec<String>,
 }
 
 impl Config {
@@ -23,6 +25,7 @@ impl Config {
         let mut tls_cert: Option<String> = None;
         let mut tls_key: Option<String> = None;
         let mut tls_flex = false;
+        let mut sni_exclude: Vec<String> = Vec::new();
 
         let mut i = 0;
         while i < args.len() {
@@ -60,6 +63,22 @@ impl Config {
                             .context("--sni требует доменное имя")?
                             .clone(),
                     );
+                }
+                "--sni-exclude" => {
+                    i += 1;
+                    let v = args
+                        .get(i)
+                        .context("--sni-exclude требует суффикс, напр. apple.com")?
+                        .trim()
+                        .to_ascii_lowercase();
+                    if v.is_empty() {
+                        bail!("--sni-exclude: пустое значение");
+                    }
+                    let v = v.trim_start_matches('*').trim_start_matches('.');
+                    if v.is_empty() {
+                        bail!("--sni-exclude: невалидное значение");
+                    }
+                    sni_exclude.push(v.to_string());
                 }
                 "--tls-cert" => {
                     i += 1;
@@ -110,6 +129,7 @@ impl Config {
             tls_cert,
             tls_key,
             tls_flex,
+            sni_exclude,
         })
     }
 
@@ -123,7 +143,8 @@ impl Config {
         eprintln!("Опции:");
         eprintln!("  --auth <user:pass>       добавить пользователя (можно повторять)");
         eprintln!("  --auth-file <путь>       загрузить пользователей из файла");
-        eprintln!("  --sni <домен>            подменять SNI в исходящих TLS-соединениях");
+        eprintln!("  --sni <домен>            подменять SNI в исходящих TLS-соединениях (:443)");
+        eprintln!("  --sni-exclude <суффикс>  не подменять SNI для хостов *.<суффикс> (можно повторять)");
         eprintln!("  --tls-cert <путь>        PEM-сертификат для входящих TLS-соединений");
         eprintln!("  --tls-key  <путь>        PEM-ключ для входящих TLS-соединений");
         eprintln!("  --tls-flex               на том же порту: plaintext SOCKS5 или TLS (нужны cert+key)");
