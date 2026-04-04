@@ -2,3 +2,6 @@
 .DS_Store
 .idea
 .vscode
+.cursor
+server.crt
+server.key

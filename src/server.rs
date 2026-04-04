@@ -6,7 +6,37 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
+use tokio::time::{timeout, Duration};
 use tokio_rustls::TlsAcceptor;
+
+/// Ждём первый байт на сокете (без снятия с буфера) для `--tls-flex`.
+#[cfg(unix)]
+async fn await_mux_first_byte(stream: &tokio::net::TcpStream) -> std::io::Result<u8> {
+    use std::io::ErrorKind;
+    let mut buf = [0u8; 1];
+    loop {
+        match peek_tcp_prefix(stream, &mut buf) {
+            Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+            Ok(_) => return Ok(buf[0]),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                stream.readable().await?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Без MSG_PEEK — один неблокирующий peek; при пустом буфере сразу WouldBlock (ограничение платформы).
+#[cfg(not(unix))]
+async fn await_mux_first_byte(stream: &tokio::net::TcpStream) -> std::io::Result<u8> {
+    use std::io::ErrorKind;
+    let mut buf = [0u8; 1];
+    match peek_tcp_prefix(stream, &mut buf)? {
+        1 => Ok(buf[0]),
+        0 => Err(ErrorKind::UnexpectedEof.into()),
+        _ => Err(ErrorKind::InvalidInput.into()),
+    }
+}
 
 #[cfg(unix)]
 fn peek_tcp_prefix(stream: &tokio::net::TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -67,11 +97,31 @@ pub async fn run(config: Config) -> Result<()> {
         tokio::spawn(async move {
             let result = match acceptor {
                 Some(tls) => {
-                    let mut peek_buf = [0u8; 1];
-                    let peek_len = peek_tcp_prefix(&stream, &mut peek_buf).unwrap_or(0);
-                    if cfg.tls_flex && peek_len > 0 && peek_buf[0] == 0x05 {
-                        tracing::info!(%peer, "SOCKS5 без TLS (--tls-flex), тот же порт что и для TLS");
-                        handle_client(stream, peer, cfg).await
+                    if cfg.tls_flex {
+                        const MUX_WAIT: Duration = Duration::from_secs(60);
+                        let first = match timeout(MUX_WAIT, await_mux_first_byte(&stream)).await {
+                            Ok(Ok(b)) => b,
+                            Ok(Err(e)) => {
+                                tracing::warn!(%peer, "(--tls-flex) ожидание первого байта: {e}");
+                                return;
+                            }
+                            Err(_) => {
+                                tracing::warn!(%peer, "(--tls-flex) таймаут ожидания первого байта");
+                                return;
+                            }
+                        };
+                        if first == 0x05 {
+                            tracing::info!(%peer, "SOCKS5 без TLS (--tls-flex), тот же порт что и для TLS");
+                            handle_client(stream, peer, cfg).await
+                        } else {
+                            match tls.accept(stream).await {
+                                Ok(tls_stream) => handle_client(tls_stream, peer, cfg).await,
+                                Err(e) => {
+                                    tracing::warn!(%peer, "TLS хендшейк не удался: {e}");
+                                    return;
+                                }
+                            }
+                        }
                     } else {
                         match tls.accept(stream).await {
                             Ok(tls_stream) => handle_client(tls_stream, peer, cfg).await,

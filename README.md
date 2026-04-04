@@ -21,3 +21,9 @@
 `cargo run --release -- 0.0.0.0:1080 \`
     `--tls-cert server.crt --tls-key server.key \`
     `--auth admin:secret --sni cloudflare.com`
+
+## C TLS + tls-flex
+
+`cargo run --release -- 0.0.0.0:1080 \`
+    `--tls-cert server.crt --tls-key server.key \`
+    `--auth admin:secret --sni cloudflare.com --tls-flex`
