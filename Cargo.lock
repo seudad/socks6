@@ -269,6 +269,7 @@ name = "socks5"
 version = "1.0.0-alpha.1"
 dependencies = [
  "anyhow",
+ "libc",
  "rustls-pemfile",
  "tokio",
  "tokio-rustls",

@@ -10,6 +10,8 @@ pub struct Config {
     pub sni_spoof: Option<Arc<str>>,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
+    /// Разрешить на том же порту и plaintext SOCKS5 (первый байт 0x05), и TLS (0x16).
+    pub tls_flex: bool,
 }
 
 impl Config {
@@ -20,6 +22,7 @@ impl Config {
         let mut sni_spoof: Option<String> = None;
         let mut tls_cert: Option<String> = None;
         let mut tls_key: Option<String> = None;
+        let mut tls_flex = false;
 
         let mut i = 0;
         while i < args.len() {
@@ -74,6 +77,9 @@ impl Config {
                             .clone(),
                     );
                 }
+                "--tls-flex" => {
+                    tls_flex = true;
+                }
                 "-h" | "--help" => {
                     Self::print_usage();
                     std::process::exit(0);
@@ -93,6 +99,9 @@ impl Config {
         if tls_cert.is_some() != tls_key.is_some() {
             bail!("нужно указать оба --tls-cert и --tls-key");
         }
+        if tls_flex && tls_cert.is_none() {
+            bail!("--tls-flex имеет смысл только вместе с --tls-cert и --tls-key");
+        }
 
         Ok(Config {
             listen: listen.context("не указан адрес (например 127.0.0.1:1080)")?,
@@ -100,6 +109,7 @@ impl Config {
             sni_spoof: sni_spoof.map(|s| Arc::from(s.as_str())),
             tls_cert,
             tls_key,
+            tls_flex,
         })
     }
 
@@ -116,6 +126,7 @@ impl Config {
         eprintln!("  --sni <домен>            подменять SNI в исходящих TLS-соединениях");
         eprintln!("  --tls-cert <путь>        PEM-сертификат для входящих TLS-соединений");
         eprintln!("  --tls-key  <путь>        PEM-ключ для входящих TLS-соединений");
+        eprintln!("  --tls-flex               на том же порту: plaintext SOCKS5 или TLS (нужны cert+key)");
         eprintln!("  -h, --help               показать справку\n");
         eprintln!("Переменные окружения:");
         eprintln!("  RUST_LOG                 уровень логирования (по умолчанию: info)");

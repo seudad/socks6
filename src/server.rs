@@ -8,11 +8,43 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
+#[cfg(unix)]
+fn peek_tcp_prefix(stream: &tokio::net::TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    stream.try_io(tokio::io::Interest::READABLE, || {
+        let fd = stream.as_raw_fd();
+        let n = unsafe {
+            libc::recv(
+                fd,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+                libc::MSG_PEEK,
+            )
+        };
+        if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn peek_tcp_prefix(_stream: &tokio::net::TcpStream, _buf: &mut [u8]) -> std::io::Result<usize> {
+    Ok(0)
+}
+
 pub async fn run(config: Config) -> Result<()> {
     let tls_acceptor = build_tls_acceptor(&config)?;
     let listener = TcpListener::bind(config.listen).await?;
 
     if tls_acceptor.is_some() {
+        if config.tls_flex {
+            tracing::info!(
+                addr = %config.listen,
+                "--tls-flex: на порту принимаются TLS и plaintext SOCKS5"
+            );
+        }
         tracing::info!(addr = %config.listen, "SOCKS5 прокси запущен (TLS)");
     } else {
         tracing::info!(addr = %config.listen, "SOCKS5 прокси запущен");
@@ -34,13 +66,22 @@ pub async fn run(config: Config) -> Result<()> {
 
         tokio::spawn(async move {
             let result = match acceptor {
-                Some(tls) => match tls.accept(stream).await {
-                    Ok(tls_stream) => handle_client(tls_stream, peer, cfg).await,
-                    Err(e) => {
-                        tracing::warn!(%peer, "TLS хендшейк не удался: {e}");
-                        return;
+                Some(tls) => {
+                    let mut peek_buf = [0u8; 1];
+                    let peek_len = peek_tcp_prefix(&stream, &mut peek_buf).unwrap_or(0);
+                    if cfg.tls_flex && peek_len > 0 && peek_buf[0] == 0x05 {
+                        tracing::info!(%peer, "SOCKS5 без TLS (--tls-flex), тот же порт что и для TLS");
+                        handle_client(stream, peer, cfg).await
+                    } else {
+                        match tls.accept(stream).await {
+                            Ok(tls_stream) => handle_client(tls_stream, peer, cfg).await,
+                            Err(e) => {
+                                tracing::warn!(%peer, "TLS хендшейк не удался: {e}");
+                                return;
+                            }
+                        }
                     }
-                },
+                }
                 None => handle_client(stream, peer, cfg).await,
             };
             if let Err(e) = result {
