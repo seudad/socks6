@@ -17,6 +17,19 @@ pub struct Config {
 }
 
 impl Config {
+    /// Суффикс в нижнем регистре, без ведущих `*` / `.`; пустое — ошибка.
+    fn normalize_sni_exclude_suffix(token: &str) -> Result<String> {
+        let v = token.trim().to_ascii_lowercase();
+        if v.is_empty() {
+            bail!("пустой суффикс SNI-exclude");
+        }
+        let v = v.trim_start_matches('*').trim_start_matches('.');
+        if v.is_empty() {
+            bail!("невалидный суффикс SNI-exclude");
+        }
+        Ok(v.to_string())
+    }
+
     pub fn from_args() -> Result<Self> {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut listen: Option<SocketAddr> = None;
@@ -66,19 +79,34 @@ impl Config {
                 }
                 "--sni-exclude" => {
                     i += 1;
-                    let v = args
+                    let raw = args
                         .get(i)
-                        .context("--sni-exclude требует суффикс, напр. apple.com")?
-                        .trim()
-                        .to_ascii_lowercase();
-                    if v.is_empty() {
-                        bail!("--sni-exclude: пустое значение");
+                        .context("--sni-exclude требует суффикс, напр. apple.com")?;
+                    let v = Self::normalize_sni_exclude_suffix(raw)
+                        .context("--sni-exclude: невалидное значение")?;
+                    sni_exclude.push(v);
+                }
+                "--sni-exclude-file" => {
+                    i += 1;
+                    let path = args
+                        .get(i)
+                        .context("--sni-exclude-file требует путь к файлу")?;
+                    let content = std::fs::read_to_string(path)
+                        .with_context(|| format!("не удалось прочитать {path}"))?;
+                    for (lineno, line) in content.lines().enumerate() {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let line = line.split('#').next().unwrap_or("").trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let v = Self::normalize_sni_exclude_suffix(line).with_context(|| {
+                            format!("{}:{}: неверный суффикс SNI-exclude", path, lineno + 1)
+                        })?;
+                        sni_exclude.push(v);
                     }
-                    let v = v.trim_start_matches('*').trim_start_matches('.');
-                    if v.is_empty() {
-                        bail!("--sni-exclude: невалидное значение");
-                    }
-                    sni_exclude.push(v.to_string());
                 }
                 "--tls-cert" => {
                     i += 1;
@@ -145,6 +173,7 @@ impl Config {
         eprintln!("  --auth-file <путь>       загрузить пользователей из файла");
         eprintln!("  --sni <домен>            подменять SNI в исходящих TLS-соединениях (:443)");
         eprintln!("  --sni-exclude <суффикс>  не подменять SNI для хостов *.<суффикс> (можно повторять)");
+        eprintln!("  --sni-exclude-file <путь>  загрузить суффиксы: по одному в строке, # — комментарий");
         eprintln!("  --tls-cert <путь>        PEM-сертификат для входящих TLS-соединений");
         eprintln!("  --tls-key  <путь>        PEM-ключ для входящих TLS-соединений");
         eprintln!("  --tls-flex               на том же порту: plaintext SOCKS5 или TLS (нужны cert+key)");

@@ -196,68 +196,14 @@ where
     let bind = remote.local_addr()?;
     socks5::send_connect_ok(&mut client, bind).await?;
 
-    let target_label = target.to_string();
     let sni = effective_sni_spoof(&config, &target);
-
-    // #region agent log
-    let spoof = config
-        .sni_spoof
-        .as_deref()
-        .map(|s| format!("\"{}\"", crate::debug_agent::ej(s)))
-        .unwrap_or_else(|| "null".to_string());
-    let eff = sni
-        .map(|s| format!("\"{}\"", crate::debug_agent::ej(s)))
-        .unwrap_or_else(|| "null".to_string());
-    crate::debug_agent::emit(
-        "H1-H2",
-        "server.rs:handle_client",
-        "tunnel_ready_before_relay",
-        "icloud-repro",
-        peer,
-        &format!(
-            r#""target":"{}","port":{},"sni_spoof_config":{},"sni_effective":{}"#,
-            crate::debug_agent::ej(&target_label),
-            target.port(),
-            spoof,
-            eff
-        ),
-    );
     if config.sni_spoof.is_some() && sni.is_none() && target.port() == 443 {
         if let socks5::TargetAddr::Domain(host, _) = &target {
-            crate::debug_agent::emit(
-                "H1-fix",
-                "server.rs:handle_client",
-                "sni_not_applied",
-                "post-fix",
-                peer,
-                &format!(
-                    r#""host":"{}","reason":"sni_exclude_suffix""#,
-                    crate::debug_agent::ej(host)
-                ),
-            );
             tracing::info!(%peer, host = %host, "подмена SNI отключена (--sni-exclude)");
         }
     }
-    // #endregion agent log
 
-    let relay_res = relay::relay(&mut client, &mut remote, sni, peer, &target_label).await;
-    // #region agent log
-    if let Err(ref e) = relay_res {
-        crate::debug_agent::emit(
-            "H4",
-            "server.rs:handle_client",
-            "relay_error",
-            "icloud-repro",
-            peer,
-            &format!(
-                r#""target":"{}","err":"{}""#,
-                crate::debug_agent::ej(&target_label),
-                crate::debug_agent::ej(&e.to_string())
-            ),
-        );
-    }
-    // #endregion agent log
-    let (up, down) = relay_res?;
+    let (up, down) = relay::relay(&mut client, &mut remote, sni).await?;
 
     tracing::info!(up, down, "релей завершён");
     Ok(())
