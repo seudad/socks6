@@ -1,12 +1,15 @@
 use anyhow::Result;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-pub async fn relay(
-    client: &mut TcpStream,
+pub async fn relay<C>(
+    client: &mut C,
     remote: &mut TcpStream,
     sni_spoof: Option<&str>,
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64)>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
     let mut extra_up = 0u64;
 
     if let Some(fake_sni) = sni_spoof {
@@ -17,8 +20,8 @@ pub async fn relay(
     Ok((up + extra_up, down))
 }
 
-async fn intercept_tls(
-    client: &mut TcpStream,
+async fn intercept_tls<C: AsyncRead + Unpin>(
+    client: &mut C,
     remote: &mut TcpStream,
     fake_sni: &str,
 ) -> Result<u64> {

@@ -1,13 +1,22 @@
 use crate::config::Config;
 use crate::{relay, socks5};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use std::io::BufReader;
 use std::net::SocketAddr;
-use tokio::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 pub async fn run(config: Config) -> Result<()> {
+    let tls_acceptor = build_tls_acceptor(&config)?;
     let listener = TcpListener::bind(config.listen).await?;
-    tracing::info!(addr = %config.listen, "SOCKS5 прокси запущен");
 
+    if tls_acceptor.is_some() {
+        tracing::info!(addr = %config.listen, "SOCKS5 прокси запущен (TLS)");
+    } else {
+        tracing::info!(addr = %config.listen, "SOCKS5 прокси запущен");
+    }
     if config.require_auth() {
         tracing::info!(users = config.users.len(), "авторизация включена");
     } else {
@@ -19,9 +28,22 @@ pub async fn run(config: Config) -> Result<()> {
 
     loop {
         let (stream, peer) = listener.accept().await?;
+        stream.set_nodelay(true).ok();
         let cfg = config.clone();
+        let acceptor = tls_acceptor.clone();
+
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, peer, cfg).await {
+            let result = match acceptor {
+                Some(tls) => match tls.accept(stream).await {
+                    Ok(tls_stream) => handle_client(tls_stream, peer, cfg).await,
+                    Err(e) => {
+                        tracing::warn!(%peer, "TLS хендшейк не удался: {e}");
+                        return;
+                    }
+                },
+                None => handle_client(stream, peer, cfg).await,
+            };
+            if let Err(e) = result {
                 tracing::warn!(%peer, "сессия завершена: {e:#}");
             }
         });
@@ -29,13 +51,14 @@ pub async fn run(config: Config) -> Result<()> {
 }
 
 #[tracing::instrument(name = "client", skip_all, fields(%peer))]
-async fn handle_client(
-    mut client: TcpStream,
+async fn handle_client<S>(
+    mut client: S,
     peer: SocketAddr,
     config: Config,
-) -> Result<()> {
-    client.set_nodelay(true)?;
-
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     socks5::handshake(&mut client, &config).await?;
     let target = socks5::read_connect(&mut client).await?;
     tracing::info!(%target, "CONNECT");
@@ -66,4 +89,40 @@ async fn handle_client(
 
     tracing::info!(up, down, "релей завершён");
     Ok(())
+}
+
+fn build_tls_acceptor(config: &Config) -> Result<Option<TlsAcceptor>> {
+    let (cert_path, key_path) = match (&config.tls_cert, &config.tls_key) {
+        (Some(c), Some(k)) => (c.as_str(), k.as_str()),
+        (None, None) => return Ok(None),
+        _ => bail!("нужно указать оба --tls-cert и --tls-key"),
+    };
+
+    use tokio_rustls::rustls;
+
+    let certs = {
+        let file = std::fs::File::open(cert_path)
+            .with_context(|| format!("не удалось открыть сертификат: {cert_path}"))?;
+        rustls_pemfile::certs(&mut BufReader::new(file))
+            .collect::<Result<Vec<_>, _>>()
+            .with_context(|| format!("ошибка чтения сертификата: {cert_path}"))?
+    };
+
+    let key = {
+        let file = std::fs::File::open(key_path)
+            .with_context(|| format!("не удалось открыть ключ: {key_path}"))?;
+        rustls_pemfile::private_key(&mut BufReader::new(file))
+            .with_context(|| format!("ошибка чтения ключа: {key_path}"))?
+            .ok_or_else(|| anyhow::anyhow!("приватный ключ не найден в {key_path}"))?
+    };
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let tls_config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("ошибка конфигурации TLS-версий")?
+        .with_no_client_auth()
+        .with_single_cert(certs, key.into())
+        .context("ошибка конфигурации TLS-сертификата")?;
+
+    Ok(Some(TlsAcceptor::from(Arc::new(tls_config))))
 }

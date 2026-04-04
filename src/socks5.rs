@@ -2,7 +2,7 @@ use crate::config::Config;
 use anyhow::{bail, Context, Result};
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const VER: u8 = 0x05;
@@ -62,7 +62,10 @@ impl TargetAddr {
 
 // ── handshake ────────────────────────────────────────────────────────────
 
-pub async fn handshake(stream: &mut TcpStream, config: &Config) -> Result<()> {
+pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    config: &Config,
+) -> Result<()> {
     let mut hdr = [0u8; 2];
     stream
         .read_exact(&mut hdr)
@@ -94,7 +97,10 @@ pub async fn handshake(stream: &mut TcpStream, config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn auth_userpass(stream: &mut TcpStream, config: &Config) -> Result<()> {
+async fn auth_userpass<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    config: &Config,
+) -> Result<()> {
     let ver = stream.read_u8().await?;
     if ver != 0x01 {
         bail!("неверная версия sub-negotiation: {ver}");
@@ -128,7 +134,9 @@ async fn auth_userpass(stream: &mut TcpStream, config: &Config) -> Result<()> {
 
 // ── CONNECT ──────────────────────────────────────────────────────────────
 
-pub async fn read_connect(stream: &mut TcpStream) -> Result<TargetAddr> {
+pub async fn read_connect<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> Result<TargetAddr> {
     let mut hdr = [0u8; 4];
     stream.read_exact(&mut hdr).await?;
 
@@ -174,13 +182,16 @@ pub async fn read_connect(stream: &mut TcpStream) -> Result<TargetAddr> {
 
 // ── replies ──────────────────────────────────────────────────────────────
 
-pub async fn send_reply(stream: &mut TcpStream, reply: Reply) -> Result<()> {
+pub async fn send_reply<S: AsyncWrite + Unpin>(stream: &mut S, reply: Reply) -> Result<()> {
     let buf = [VER, reply as u8, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
     stream.write_all(&buf).await?;
     Ok(())
 }
 
-pub async fn send_connect_ok(stream: &mut TcpStream, bind: SocketAddr) -> Result<()> {
+pub async fn send_connect_ok<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    bind: SocketAddr,
+) -> Result<()> {
     let mut buf = Vec::with_capacity(22);
     buf.extend_from_slice(&[VER, Reply::Succeeded as u8, 0x00]);
     match bind {

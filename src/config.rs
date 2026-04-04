@@ -8,6 +8,8 @@ pub struct Config {
     pub listen: SocketAddr,
     pub users: Arc<HashMap<String, String>>,
     pub sni_spoof: Option<Arc<str>>,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
 }
 
 impl Config {
@@ -16,6 +18,8 @@ impl Config {
         let mut listen: Option<SocketAddr> = None;
         let mut users = HashMap::new();
         let mut sni_spoof: Option<String> = None;
+        let mut tls_cert: Option<String> = None;
+        let mut tls_key: Option<String> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -54,6 +58,22 @@ impl Config {
                             .clone(),
                     );
                 }
+                "--tls-cert" => {
+                    i += 1;
+                    tls_cert = Some(
+                        args.get(i)
+                            .context("--tls-cert требует путь к PEM-сертификату")?
+                            .clone(),
+                    );
+                }
+                "--tls-key" => {
+                    i += 1;
+                    tls_key = Some(
+                        args.get(i)
+                            .context("--tls-key требует путь к PEM-ключу")?
+                            .clone(),
+                    );
+                }
                 "-h" | "--help" => {
                     Self::print_usage();
                     std::process::exit(0);
@@ -70,10 +90,16 @@ impl Config {
             i += 1;
         }
 
+        if tls_cert.is_some() != tls_key.is_some() {
+            bail!("нужно указать оба --tls-cert и --tls-key");
+        }
+
         Ok(Config {
             listen: listen.context("не указан адрес (например 127.0.0.1:1080)")?,
             users: Arc::new(users),
             sni_spoof: sni_spoof.map(|s| Arc::from(s.as_str())),
+            tls_cert,
+            tls_key,
         })
     }
 
@@ -88,6 +114,8 @@ impl Config {
         eprintln!("  --auth <user:pass>       добавить пользователя (можно повторять)");
         eprintln!("  --auth-file <путь>       загрузить пользователей из файла");
         eprintln!("  --sni <домен>            подменять SNI в исходящих TLS-соединениях");
+        eprintln!("  --tls-cert <путь>        PEM-сертификат для входящих TLS-соединений");
+        eprintln!("  --tls-key  <путь>        PEM-ключ для входящих TLS-соединений");
         eprintln!("  -h, --help               показать справку\n");
         eprintln!("Переменные окружения:");
         eprintln!("  RUST_LOG                 уровень логирования (по умолчанию: info)");
