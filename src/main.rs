@@ -1,9 +1,3 @@
-mod config;
-mod relay;
-mod server;
-mod sni;
-mod socks5;
-
 use std::process;
 
 #[tokio::main]
@@ -15,17 +9,17 @@ async fn main() {
         )
         .init();
 
-    let config = match config::Config::from_args() {
+    let config = match socks5::config::Config::from_args() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("ошибка: {e:#}");
             eprintln!();
-            config::Config::print_usage();
+            socks5::config::Config::print_usage();
             process::exit(1);
         }
     };
 
-    if let Err(e) = server::run(config).await {
+    if let Err(e) = socks5::server::run(config).await {
         tracing::error!("фатальная ошибка: {e:#}");
         process::exit(1);
     }

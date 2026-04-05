@@ -1,17 +1,18 @@
 use crate::config::Config;
-use crate::{relay, socks5};
+use crate::{reality, relay, socks5};
 use anyhow::{bail, Context, Result};
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
 use tokio_rustls::TlsAcceptor;
 
-/// Ждём первый байт на сокете (без снятия с буфера) для `--tls-flex`.
+// ── Peek helpers for --tls-flex ─────────────────────────────────────────
+
 #[cfg(unix)]
-async fn await_mux_first_byte(stream: &tokio::net::TcpStream) -> std::io::Result<u8> {
+async fn await_mux_first_byte(stream: &TcpStream) -> std::io::Result<u8> {
     use std::io::ErrorKind;
     let mut buf = [0u8; 1];
     loop {
@@ -26,9 +27,8 @@ async fn await_mux_first_byte(stream: &tokio::net::TcpStream) -> std::io::Result
     }
 }
 
-/// Без MSG_PEEK — один неблокирующий peek; при пустом буфере сразу WouldBlock (ограничение платформы).
 #[cfg(not(unix))]
-async fn await_mux_first_byte(stream: &tokio::net::TcpStream) -> std::io::Result<u8> {
+async fn await_mux_first_byte(stream: &TcpStream) -> std::io::Result<u8> {
     use std::io::ErrorKind;
     let mut buf = [0u8; 1];
     match peek_tcp_prefix(stream, &mut buf)? {
@@ -39,7 +39,7 @@ async fn await_mux_first_byte(stream: &tokio::net::TcpStream) -> std::io::Result
 }
 
 #[cfg(unix)]
-fn peek_tcp_prefix(stream: &tokio::net::TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
+fn peek_tcp_prefix(stream: &TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
     use std::os::fd::AsRawFd;
     stream.try_io(tokio::io::Interest::READABLE, || {
         let fd = stream.as_raw_fd();
@@ -60,15 +60,24 @@ fn peek_tcp_prefix(stream: &tokio::net::TcpStream, buf: &mut [u8]) -> std::io::R
 }
 
 #[cfg(not(unix))]
-fn peek_tcp_prefix(_stream: &tokio::net::TcpStream, _buf: &mut [u8]) -> std::io::Result<usize> {
+fn peek_tcp_prefix(_stream: &TcpStream, _buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(0)
 }
 
+// ── Main entry point ────────────────────────────────────────────────────
+
 pub async fn run(config: Config) -> Result<()> {
-    let tls_acceptor = build_tls_acceptor(&config)?;
+    let force_tls13 = config.reality_enabled();
+    let tls_acceptor = build_tls_acceptor(&config, force_tls13)?;
     let listener = TcpListener::bind(config.listen).await?;
 
-    if tls_acceptor.is_some() {
+    if config.reality_enabled() {
+        tracing::info!(
+            addr = %config.listen,
+            dest = config.reality_dest.as_deref().unwrap_or("-"),
+            "SOCKS5 прокси запущен (Reality + TLS 1.3)"
+        );
+    } else if tls_acceptor.is_some() {
         if config.tls_flex {
             tracing::info!(
                 addr = %config.listen,
@@ -101,24 +110,13 @@ pub async fn run(config: Config) -> Result<()> {
         let acceptor = tls_acceptor.clone();
 
         tokio::spawn(async move {
-            let result = match acceptor {
-                Some(tls) => {
-                    if cfg.tls_flex {
-                        const MUX_WAIT: Duration = Duration::from_secs(60);
-                        let first = match timeout(MUX_WAIT, await_mux_first_byte(&stream)).await {
-                            Ok(Ok(b)) => b,
-                            Ok(Err(e)) => {
-                                tracing::warn!(%peer, "(--tls-flex) ожидание первого байта: {e}");
-                                return;
-                            }
-                            Err(_) => {
-                                tracing::warn!(%peer, "(--tls-flex) таймаут ожидания первого байта");
-                                return;
-                            }
-                        };
-                        if first == 0x05 {
-                            tracing::info!(%peer, "SOCKS5 без TLS (--tls-flex), тот же порт что и для TLS");
-                            handle_client(stream, peer, cfg).await
+            let result = if cfg.reality_enabled() {
+                handle_reality_connection(stream, peer, cfg, acceptor.unwrap()).await
+            } else {
+                match acceptor {
+                    Some(tls) => {
+                        if cfg.tls_flex {
+                            handle_tls_flex(stream, peer, cfg, tls).await
                         } else {
                             match tls.accept(stream).await {
                                 Ok(tls_stream) => handle_client(tls_stream, peer, cfg).await,
@@ -128,17 +126,9 @@ pub async fn run(config: Config) -> Result<()> {
                                 }
                             }
                         }
-                    } else {
-                        match tls.accept(stream).await {
-                            Ok(tls_stream) => handle_client(tls_stream, peer, cfg).await,
-                            Err(e) => {
-                                tracing::warn!(%peer, "TLS хендшейк не удался: {e}");
-                                return;
-                            }
-                        }
                     }
+                    None => handle_client(stream, peer, cfg).await,
                 }
-                None => handle_client(stream, peer, cfg).await,
             };
             if let Err(e) = result {
                 tracing::warn!(%peer, "сессия завершена: {e:#}");
@@ -146,6 +136,156 @@ pub async fn run(config: Config) -> Result<()> {
         });
     }
 }
+
+// ── Reality accept path ─────────────────────────────────────────────────
+
+/// Reality accept path.
+///
+/// 1. Read the ClientHello, extract SNI for fallback routing.
+/// 2. If SNI matches `--reality-server-names` → TLS handshake + in-tunnel auth → SOCKS5.
+/// 3. Otherwise → relay raw bytes to `--reality-dest` (prober sees the real cover cert).
+async fn handle_reality_connection(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    config: Config,
+    tls: TlsAcceptor,
+) -> Result<()> {
+    const CH_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let first = match timeout(CH_TIMEOUT, await_mux_first_byte(&stream)).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            tracing::debug!(%peer, "Reality: peek error: {e}");
+            return Ok(());
+        }
+        Err(_) => {
+            tracing::debug!(%peer, "Reality: таймаут ожидания данных");
+            return Ok(());
+        }
+    };
+
+    let dest = config.reality_dest.as_deref().unwrap();
+
+    if first != 0x16 {
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await.unwrap_or(0);
+        buf.truncate(n);
+        tracing::info!(%peer, "Reality: не TLS ({first:#x}), fallback → {dest}");
+        reality::fallback_relay(stream, buf, dest).await.ok();
+        return Ok(());
+    }
+
+    let ch_buf = match timeout(CH_TIMEOUT, reality::read_tls_record(&mut stream)).await {
+        Ok(Ok(buf)) => buf,
+        Ok(Err(e)) => {
+            tracing::debug!(%peer, "Reality: ошибка чтения CH: {e}");
+            return Ok(());
+        }
+        Err(_) => {
+            tracing::debug!(%peer, "Reality: таймаут чтения CH");
+            return Ok(());
+        }
+    };
+
+    let fields = match reality::parse_client_hello(&ch_buf) {
+        Some(f) => f,
+        None => {
+            tracing::info!(%peer, "Reality: невалидный ClientHello, fallback → {dest}");
+            reality::fallback_relay(stream, ch_buf, dest).await.ok();
+            return Ok(());
+        }
+    };
+
+    let sni_ok = fields
+        .sni
+        .as_ref()
+        .map(|s| config.reality_server_names.iter().any(|n| n == s))
+        .unwrap_or(false);
+
+    if !sni_ok {
+        tracing::info!(%peer, sni = ?fields.sni, "Reality: SNI не в списке, fallback → {dest}");
+        reality::fallback_relay(stream, ch_buf, dest).await.ok();
+        return Ok(());
+    }
+
+    // SNI matches — do TLS handshake, then verify in-tunnel auth
+    let replay = reality::ReplayStream::new(ch_buf, stream);
+    let mut tls_stream = match tls.accept(replay).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(%peer, "Reality: TLS хендшейк не удался: {e}");
+            return Ok(());
+        }
+    };
+
+    let secret = config.reality_secret.as_ref().unwrap();
+    const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+    let auth_result = timeout(
+        AUTH_TIMEOUT,
+        reality::recv_and_verify_tunnel_auth(
+            &mut tls_stream,
+            secret,
+            &config.reality_short_ids,
+            config.reality_max_time_diff,
+        ),
+    )
+    .await;
+
+    match auth_result {
+        Ok(Ok(short_id)) => {
+            tracing::info!(
+                %peer,
+                short_id = %reality::hex_encode(&short_id),
+                "Reality: аутентификация ОК"
+            );
+            handle_client(tls_stream, peer, config).await
+        }
+        Ok(Err(e)) => {
+            tracing::info!(%peer, "Reality: auth failed: {e:#}");
+            Ok(())
+        }
+        Err(_) => {
+            tracing::info!(%peer, "Reality: auth таймаут");
+            Ok(())
+        }
+    }
+}
+
+// ── TLS-flex path ───────────────────────────────────────────────────────
+
+async fn handle_tls_flex(
+    stream: TcpStream,
+    peer: SocketAddr,
+    config: Config,
+    tls: TlsAcceptor,
+) -> Result<()> {
+    const MUX_WAIT: Duration = Duration::from_secs(60);
+    let first = match timeout(MUX_WAIT, await_mux_first_byte(&stream)).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            tracing::warn!(%peer, "(--tls-flex) peek: {e}");
+            return Ok(());
+        }
+        Err(_) => {
+            tracing::warn!(%peer, "(--tls-flex) таймаут");
+            return Ok(());
+        }
+    };
+    if first == 0x05 {
+        tracing::info!(%peer, "SOCKS5 plaintext (--tls-flex)");
+        handle_client(stream, peer, config).await
+    } else {
+        match tls.accept(stream).await {
+            Ok(tls_stream) => handle_client(tls_stream, peer, config).await,
+            Err(e) => {
+                tracing::warn!(%peer, "TLS хендшейк не удался: {e}");
+                Ok(())
+            }
+        }
+    }
+}
+
+// ── Client handler ──────────────────────────────────────────────────────
 
 /// Подмена SNI только для порта 443 и если имя хоста не попадает под `--sni-exclude`.
 fn effective_sni_spoof<'a>(config: &'a Config, target: &socks5::TargetAddr) -> Option<&'a str> {
@@ -209,7 +349,9 @@ where
     Ok(())
 }
 
-fn build_tls_acceptor(config: &Config) -> Result<Option<TlsAcceptor>> {
+// ── TLS acceptor builder ────────────────────────────────────────────────
+
+fn build_tls_acceptor(config: &Config, force_tls13: bool) -> Result<Option<TlsAcceptor>> {
     let (cert_path, key_path) = match (&config.tls_cert, &config.tls_key) {
         (Some(c), Some(k)) => (c.as_str(), k.as_str()),
         (None, None) => return Ok(None),
@@ -235,9 +377,18 @@ fn build_tls_acceptor(config: &Config) -> Result<Option<TlsAcceptor>> {
     };
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let tls_config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .context("ошибка конфигурации TLS-версий")?
+
+    let builder = if force_tls13 {
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .context("ошибка конфигурации TLS 1.3")?
+    } else {
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .context("ошибка конфигурации TLS-версий")?
+    };
+
+    let tls_config = builder
         .with_no_client_auth()
         .with_single_cert(certs, key.into())
         .context("ошибка конфигурации TLS-сертификата")?;
