@@ -1,5 +1,13 @@
 # SOCKS6 (socks5+Reality)
 
+[![Github issues](https://img.shields.io/github/issues/seudad/socks6)](https://github.com/seudad/socks6/issues)
+[![language](https://img.shields.io/github/languages/top/seudad/socks6
+)](https://github.com/seudad/socks6/)
+[![Github issues](https://img.shields.io/github/v/release/seudad/socks6
+)]()
+[![Github issues](https://img.shields.io/github/license/seudad/socks6
+)](https://github.com/seudad/socks6/)
+
 Дополненный Socks5 протокол с Reality с коробки
 
 >___
