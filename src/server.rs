@@ -95,6 +95,11 @@ pub async fn run(config: Config) -> Result<()> {
     }
     if let Some(ref sni) = config.sni_spoof {
         tracing::info!(sni = %sni, "подмена SNI включена");
+        tracing::warn!(
+            "подмена SNI на домен в CONNECT отключена для ATYP IP (только имя хоста). \
+             Для HTTPS к youtube/tiktok/gstatic и т.п. при ATYP DOMAIN добавьте суффиксы через \
+             --sni-exclude / --sni-exclude-file, иначе TLS к не-Google целям может «висеть»."
+        );
         if !config.sni_exclude.is_empty() {
             tracing::info!(
                 exclude = ?config.sni_exclude,
@@ -287,7 +292,10 @@ async fn handle_tls_flex(
 
 // ── Client handler ──────────────────────────────────────────────────────
 
-/// Подмена SNI только для порта 443 и если имя хоста не попадает под `--sni-exclude`.
+/// Подмена SNI только для порта 443, домена в SOCKS5 (не IP) и если имя не в `--sni-exclude`.
+///
+/// Для `ATYP` IPv4/IPv6 подмену отключаем: клиенты вроде Shadowrocket часто резолвят DNS
+/// локально и шлёп IP в CONNECT — подмена SNI на «cover» тогда ломает TLS к реальному хосту.
 fn effective_sni_spoof<'a>(config: &'a Config, target: &socks5::TargetAddr) -> Option<&'a str> {
     if target.port() != 443 {
         return None;
@@ -303,7 +311,7 @@ fn effective_sni_spoof<'a>(config: &'a Config, target: &socks5::TargetAddr) -> O
             }
             Some(spoof)
         }
-        socks5::TargetAddr::Ip(_) => Some(spoof),
+        socks5::TargetAddr::Ip(_) => None,
     }
 }
 

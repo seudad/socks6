@@ -1,6 +1,6 @@
 [package]
 name = "socks5"
-version = "1.0.0-alpha.1"
+version = "2.1.1-alpha"
 edition = "2024"
 
 [lib]
@@ -16,7 +16,7 @@ name = "socks5-client"
 path = "src/bin/client.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"

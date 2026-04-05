@@ -1,34 +1,13 @@
 use anyhow::{bail, Context, Result};
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio_rustls::rustls;
 use tokio_rustls::TlsConnector;
-
-// #region agent log
-fn dbg_agent_log(hypothesis_id: &str, location: &str, message: &str, data: &str) {
-    use std::io::Write;
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-    let line = format!(
-        "{{\"sessionId\":\"494c8d\",\"hypothesisId\":\"{}\",\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"timestamp\":{}}}",
-        esc(hypothesis_id),
-        esc(location),
-        esc(message),
-        data,
-        ts
-    );
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/Users/seeu/rust/socks5/.cursor/debug-494c8d.log")
-        .and_then(|mut f| writeln!(f, "{line}"));
-}
-// #endregion
 
 // ── Client config ───────────────────────────────────────────────────────
 
@@ -39,6 +18,8 @@ struct ClientConfig {
     secret: [u8; 32],
     short_id: [u8; 8],
     auth: Option<(String, String)>,
+    /// Макс. одновременных установок TLS к серверу (остальные ждут в очереди).
+    max_tls_parallel: usize,
 }
 
 impl ClientConfig {
@@ -50,6 +31,7 @@ impl ClientConfig {
         let mut secret: Option<[u8; 32]> = None;
         let mut short_id: Option<[u8; 8]> = None;
         let mut auth: Option<(String, String)> = None;
+        let mut max_tls_parallel: Option<usize> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -111,6 +93,15 @@ impl ClientConfig {
                     let (u, p) = pair.split_once(':').context("формат: user:pass")?;
                     auth = Some((u.to_owned(), p.to_owned()));
                 }
+                "--max-tls" => {
+                    i += 1;
+                    max_tls_parallel = Some(
+                        args.get(i)
+                            .context("--max-tls требует число")?
+                            .parse()
+                            .context("--max-tls: невалидное число")?,
+                    );
+                }
                 "-h" | "--help" => {
                     Self::print_usage();
                     std::process::exit(0);
@@ -120,6 +111,17 @@ impl ClientConfig {
             i += 1;
         }
 
+        let max_tls_parallel = max_tls_parallel
+            .or_else(|| {
+                std::env::var("SOCKS5_CLIENT_MAX_TLS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(12);
+        if max_tls_parallel == 0 {
+            bail!("--max-tls / SOCKS5_CLIENT_MAX_TLS должен быть >= 1");
+        }
+
         Ok(ClientConfig {
             listen: listen.unwrap_or_else(|| "127.0.0.1:1080".parse().unwrap()),
             server: server.context("--server обязателен")?,
@@ -127,6 +129,7 @@ impl ClientConfig {
             secret: secret.context("--secret обязателен")?,
             short_id: short_id.context("--short-id обязателен")?,
             auth,
+            max_tls_parallel,
         })
     }
 
@@ -140,6 +143,7 @@ impl ClientConfig {
         eprintln!("  --secret <base64>        общий секрет Reality");
         eprintln!("  --short-id <hex>         Short ID (16 hex символов)");
         eprintln!("  --auth <user:pass>       авторизация на сервере (если включена)");
+        eprintln!("  --max-tls <N>            одновременных TLS к серверу (по умолчанию 12; env SOCKS5_CLIENT_MAX_TLS)");
         eprintln!("  -h, --help               показать справку");
     }
 }
@@ -220,20 +224,23 @@ async fn run(config: ClientConfig) -> Result<()> {
         addr = %config.listen,
         server = %config.server,
         sni = %config.server_name,
+        max_tls = config.max_tls_parallel,
         "Reality клиент запущен"
     );
 
     let config = Arc::new(config);
     let tls_config = Arc::new(tls_config);
+    let tls_slots = Arc::new(Semaphore::new(config.max_tls_parallel));
 
     loop {
         let (stream, peer) = listener.accept().await?;
         stream.set_nodelay(true).ok();
         let cfg = config.clone();
         let tls_cfg = tls_config.clone();
+        let slots = tls_slots.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_local_client(stream, peer, cfg, tls_cfg).await {
+            if let Err(e) = handle_local_client(stream, peer, cfg, tls_cfg, slots).await {
                 tracing::warn!(%peer, "сессия завершена: {e:#}");
             }
         });
@@ -248,73 +255,66 @@ async fn handle_local_client(
     peer: SocketAddr,
     config: Arc<ClientConfig>,
     tls_config: Arc<rustls::ClientConfig>,
+    tls_slots: Arc<Semaphore>,
 ) -> Result<()> {
     // 1. Accept SOCKS5 from local app
     local_socks5_handshake(&mut local).await?;
     let (host, port) = local_socks5_read_connect(&mut local).await?;
     tracing::info!(target = %format!("{host}:{port}"), "CONNECT");
 
-    // #region agent log
-    {
-        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-        let data = format!(
-            r#"{{"peer":"{}","target":"{}","target_port":{},"remote":"{}","sni":"{}"}}"#,
-            peer,
-            esc(&host),
-            port,
-            esc(&config.server),
-            esc(&config.server_name)
-        );
-        dbg_agent_log("H2", "client.rs:after_socks_connect", "SOCKS5 CONNECT parsed", &data);
-    }
-    // #endregion
+    // 2. Ограничить параллельные TLS к одному серверу (иначе при бурстах — tls handshake eof).
+    let mut tunnel = {
+        let _tls_slot = tls_slots
+            .acquire()
+            .await
+            .context("TLS: семафор закрыт")?;
 
-    // 2. Connect to Reality server via TLS
-    let tcp = TcpStream::connect(&config.server)
-        .await
-        .with_context(|| format!("TCP к {}", config.server))?;
-    tcp.set_nodelay(true).ok();
+        let connector = TlsConnector::from(tls_config);
+        const MAX_TLS_HANDSHAKE_TRIES: u32 = 3;
+        let mut attempt: u32 = 0;
+        let mut tunnel = loop {
+            attempt += 1;
+            let tcp = TcpStream::connect(&config.server)
+                .await
+                .with_context(|| format!("TCP к {}", config.server))?;
+            tcp.set_nodelay(true).ok();
 
-    // #region agent log
-    dbg_agent_log(
-        "H3",
-        "client.rs:tcp_ok",
-        "TCP connect to remote OK",
-        &format!(r#"{{"peer":"{}","remote":"{}"}}"#, peer, config.server),
-    );
-    // #endregion
+            let name = rustls::pki_types::ServerName::try_from(config.server_name.clone())
+                .context("невалидный SNI")?;
+            match connector.connect(name, tcp).await {
+                Ok(t) => {
+                    if attempt > 1 {
+                        tracing::debug!(%peer, attempt, "TLS: успех после повтора");
+                    }
+                    break t;
+                }
+                Err(e) => {
+                    let retriable = matches!(
+                        e.kind(),
+                        ErrorKind::UnexpectedEof
+                            | ErrorKind::ConnectionReset
+                            | ErrorKind::ConnectionAborted
+                    ) || e.to_string().to_lowercase().contains("eof");
+                    if retriable && attempt < MAX_TLS_HANDSHAKE_TRIES {
+                        tracing::debug!(%peer, attempt, err = %e, "TLS: повтор handshake");
+                        tokio::time::sleep(Duration::from_millis(40 + 60 * attempt as u64)).await;
+                        continue;
+                    }
+                    return Err(e).context("TLS хендшейк");
+                }
+            }
+        };
 
-    let connector = TlsConnector::from(tls_config);
-    let name = rustls::pki_types::ServerName::try_from(config.server_name.clone())
-        .context("невалидный SNI")?;
-    let mut tunnel = connector
-        .connect(name, tcp)
-        .await
-        .map_err(|e| {
-            // #region agent log
-            let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-            let data = format!(
-                r#"{{"peer":"{}","remote":"{}","err":"{}","unexpected_eof":{}}}"#,
-                peer,
-                esc(&config.server),
-                esc(&e.to_string()),
-                e.to_string().to_lowercase().contains("eof")
-            );
-            dbg_agent_log("H1", "client.rs:tls_err", "TLS handshake error", &data);
-            // #endregion
-            e
-        })
-        .context("TLS хендшейк")?;
+        socks5::reality::send_tunnel_auth(&mut tunnel, &config.secret, &config.short_id)
+            .await
+            .context("Reality аутентификация")?;
 
-    // 3. Send Reality auth inside TLS tunnel
-    socks5::reality::send_tunnel_auth(&mut tunnel, &config.secret, &config.short_id)
-        .await
-        .context("Reality аутентификация")?;
+        remote_socks5_connect(&mut tunnel, &host, port, config.auth.as_ref())
+            .await
+            .context("SOCKS5 через туннель")?;
 
-    // 4. SOCKS5 to the remote server (through TLS tunnel)
-    remote_socks5_connect(&mut tunnel, &host, port, config.auth.as_ref())
-        .await
-        .context("SOCKS5 через туннель")?;
+        tunnel
+    };
 
     // 5. Send CONNECT OK to local app
     local_socks5_send_ok(&mut local).await?;
@@ -378,6 +378,7 @@ async fn local_socks5_send_ok(stream: &mut TcpStream) -> Result<()> {
     stream
         .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await?;
+    stream.flush().await.context("flush SOCKS5 CONNECT OK")?;
     Ok(())
 }
 

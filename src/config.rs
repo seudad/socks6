@@ -289,8 +289,8 @@ impl Config {
         eprintln!("Опции:");
         eprintln!("  --auth <user:pass>               добавить пользователя (можно повторять)");
         eprintln!("  --auth-file <путь>               загрузить пользователей из файла");
-        eprintln!("  --sni <домен>                    подменять SNI в исходящих TLS (:443)");
-        eprintln!("  --sni-exclude <суффикс>          не подменять SNI для *.<суффикс>");
+        eprintln!("  --sni <домен>                    подменять SNI в исходящих TLS (:443), только если CONNECT с доменом; для CONNECT по IP не трогаем");
+        eprintln!("  --sni-exclude <суффикс>          не подменять SNI для *.<суффикс> (youtube.com, tiktokv.com, …)");
         eprintln!("  --sni-exclude-file <путь>        загрузить суффиксы из файла");
         eprintln!("  --tls-cert <путь>                PEM-сертификат для TLS");
         eprintln!("  --tls-key  <путь>                PEM-ключ для TLS");
