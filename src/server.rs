@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::{reality, relay, socks5};
+use crate::{reality, relay, socks6};
 use anyhow::{bail, Context, Result};
 use std::io::BufReader;
 use std::net::SocketAddr;
@@ -75,18 +75,18 @@ pub async fn run(config: Config) -> Result<()> {
         tracing::info!(
             addr = %config.listen,
             dest = config.reality_dest.as_deref().unwrap_or("-"),
-            "SOCKS5 прокси запущен (Reality + TLS 1.3)"
+            "SOCKS6 прокси запущен (Reality + TLS 1.3)"
         );
     } else if tls_acceptor.is_some() {
         if config.tls_flex {
             tracing::info!(
                 addr = %config.listen,
-                "--tls-flex: на порту принимаются TLS и plaintext SOCKS5"
+                "--tls-flex: на порту принимаются TLS и plaintext SOCKS6"
             );
         }
-        tracing::info!(addr = %config.listen, "SOCKS5 прокси запущен (TLS)");
+        tracing::info!(addr = %config.listen, "SOCKS6 прокси запущен (TLS)");
     } else {
-        tracing::info!(addr = %config.listen, "SOCKS5 прокси запущен");
+        tracing::info!(addr = %config.listen, "SOCKS6 прокси запущен");
     }
     if config.require_auth() {
         tracing::info!(users = config.users.len(), "авторизация включена");
@@ -147,7 +147,7 @@ pub async fn run(config: Config) -> Result<()> {
 /// Reality accept path.
 ///
 /// 1. Read the ClientHello, extract SNI for fallback routing.
-/// 2. If SNI matches `--reality-server-names` → TLS handshake + in-tunnel auth → SOCKS5.
+/// 2. If SNI matches `--reality-server-names` → TLS handshake + in-tunnel auth → SOCKS6.
 /// 3. Otherwise → relay raw bytes to `--reality-dest` (prober sees the real cover cert).
 async fn handle_reality_connection(
     mut stream: TcpStream,
@@ -277,7 +277,7 @@ async fn handle_tls_flex(
         }
     };
     if first == 0x05 {
-        tracing::info!(%peer, "SOCKS5 plaintext (--tls-flex)");
+        tracing::info!(%peer, "SOCKS6 plaintext (--tls-flex)");
         handle_client(stream, peer, config).await
     } else {
         match tls.accept(stream).await {
@@ -292,17 +292,17 @@ async fn handle_tls_flex(
 
 // ── Client handler ──────────────────────────────────────────────────────
 
-/// Подмена SNI только для порта 443, домена в SOCKS5 (не IP) и если имя не в `--sni-exclude`.
+/// Подмена SNI только для порта 443, домена в SOCKS6 (не IP) и если имя не в `--sni-exclude`.
 ///
 /// Для `ATYP` IPv4/IPv6 подмену отключаем: клиенты вроде Shadowrocket часто резолвят DNS
 /// локально и шлёп IP в CONNECT — подмена SNI на «cover» тогда ломает TLS к реальному хосту.
-fn effective_sni_spoof<'a>(config: &'a Config, target: &socks5::TargetAddr) -> Option<&'a str> {
+fn effective_sni_spoof<'a>(config: &'a Config, target: &socks6::TargetAddr) -> Option<&'a str> {
     if target.port() != 443 {
         return None;
     }
     let spoof = config.sni_spoof.as_deref()?;
     match target {
-        socks5::TargetAddr::Domain(host, _) => {
+        socks6::TargetAddr::Domain(host, _) => {
             let h = host.to_ascii_lowercase();
             for p in &config.sni_exclude {
                 if h == *p || h.ends_with(&format!(".{}", p)) {
@@ -311,7 +311,7 @@ fn effective_sni_spoof<'a>(config: &'a Config, target: &socks5::TargetAddr) -> O
             }
             Some(spoof)
         }
-        socks5::TargetAddr::Ip(_) => None,
+        socks6::TargetAddr::Ip(_) => None,
     }
 }
 
@@ -324,29 +324,29 @@ async fn handle_client<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    socks5::handshake(&mut client, &config).await?;
-    let target = socks5::read_connect(&mut client).await?;
+    socks6::handshake(&mut client, &config).await?;
+    let target = socks6::read_connect(&mut client).await?;
     tracing::info!(%target, "CONNECT");
 
     let mut remote = match target.connect().await {
         Ok(s) => s,
         Err(e) => {
             let reply = match e.kind() {
-                std::io::ErrorKind::ConnectionRefused => socks5::Reply::ConnectionRefused,
-                _ => socks5::Reply::HostUnreachable,
+                std::io::ErrorKind::ConnectionRefused => socks6::Reply::ConnectionRefused,
+                _ => socks6::Reply::HostUnreachable,
             };
-            socks5::send_reply(&mut client, reply).await.ok();
+            socks6::send_reply(&mut client, reply).await.ok();
             bail!("подключение к {target} не удалось: {e}");
         }
     };
     remote.set_nodelay(true)?;
 
     let bind = remote.local_addr()?;
-    socks5::send_connect_ok(&mut client, bind).await?;
+    socks6::send_connect_ok(&mut client, bind).await?;
 
     let sni = effective_sni_spoof(&config, &target);
     if config.sni_spoof.is_some() && sni.is_none() && target.port() == 443 {
-        if let socks5::TargetAddr::Domain(host, _) = &target {
+        if let socks6::TargetAddr::Domain(host, _) = &target {
             tracing::info!(%peer, host = %host, "подмена SNI отключена (--sni-exclude)");
         }
     }

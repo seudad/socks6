@@ -1,18 +1,18 @@
 [package]
-name = "socks5"
+name = "socks6"
 version = "2.1.1-alpha"
 edition = "2024"
 
 [lib]
-name = "socks5"
+name = "socks6"
 path = "src/lib.rs"
 
 [[bin]]
-name = "socks5"
+name = "socks6"
 path = "src/main.rs"
 
 [[bin]]
-name = "socks5-client"
+name = "socks6-client"
 path = "src/bin/client.rs"
 
 [dependencies]

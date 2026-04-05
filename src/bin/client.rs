@@ -76,7 +76,7 @@ impl ClientConfig {
                     i += 1;
                     let hex = args.get(i).context("--short-id требует hex")?;
                     let bytes =
-                        socks5::reality::hex_decode(hex).context("невалидный hex")?;
+                        socks6::reality::hex_decode(hex).context("невалидный hex")?;
                     if bytes.len() != 8 {
                         bail!(
                             "short-id: ожидается 8 байт (16 hex), получено {}",
@@ -113,13 +113,13 @@ impl ClientConfig {
 
         let max_tls_parallel = max_tls_parallel
             .or_else(|| {
-                std::env::var("SOCKS5_CLIENT_MAX_TLS")
+                std::env::var("SOCKS6_CLIENT_MAX_TLS")
                     .ok()
                     .and_then(|s| s.parse().ok())
             })
             .unwrap_or(12);
         if max_tls_parallel == 0 {
-            bail!("--max-tls / SOCKS5_CLIENT_MAX_TLS должен быть >= 1");
+            bail!("--max-tls / SOCKS6_CLIENT_MAX_TLS должен быть >= 1");
         }
 
         Ok(ClientConfig {
@@ -134,8 +134,8 @@ impl ClientConfig {
     }
 
     fn print_usage() {
-        eprintln!("Reality SOCKS5 клиент\n");
-        eprintln!("Использование: socks5-client [ОПЦИИ]\n");
+        eprintln!("Reality SOCKS6 клиент\n");
+        eprintln!("Использование: socks6-client [ОПЦИИ]\n");
         eprintln!("Опции:");
         eprintln!("  --listen, -l <addr>      локальный адрес (по умолчанию 127.0.0.1:1080)");
         eprintln!("  --server, -s <addr>      адрес Reality сервера (host:port)");
@@ -143,7 +143,7 @@ impl ClientConfig {
         eprintln!("  --secret <base64>        общий секрет Reality");
         eprintln!("  --short-id <hex>         Short ID (16 hex символов)");
         eprintln!("  --auth <user:pass>       авторизация на сервере (если включена)");
-        eprintln!("  --max-tls <N>            одновременных TLS к серверу (по умолчанию 12; env SOCKS5_CLIENT_MAX_TLS)");
+        eprintln!("  --max-tls <N>            одновременных TLS к серверу (по умолчанию 12; env SOCKS6_CLIENT_MAX_TLS)");
         eprintln!("  -h, --help               показать справку");
     }
 }
@@ -155,7 +155,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "socks5_client=info".parse().unwrap()),
+                .unwrap_or_else(|_| "socks6_client=info".parse().unwrap()),
         )
         .init();
 
@@ -175,7 +175,7 @@ async fn main() {
     }
 }
 
-/// Каждое SOCKS5-соединение держит отдельный сокет к приложению и отдельный TLS к серверу.
+/// Каждое SOCKS6-соединение держит отдельный сокет к приложению и отдельный TLS к серверу.
 /// При низком `ulimit -n` (часто 256 на macOS) получают EMFILE / «Too many open files».
 #[cfg(unix)]
 fn raise_nofile_limit() {
@@ -257,9 +257,9 @@ async fn handle_local_client(
     tls_config: Arc<rustls::ClientConfig>,
     tls_slots: Arc<Semaphore>,
 ) -> Result<()> {
-    // 1. Accept SOCKS5 from local app
-    local_socks5_handshake(&mut local).await?;
-    let (host, port) = local_socks5_read_connect(&mut local).await?;
+    // 1. Accept SOCKS6 from local app
+    local_socks6_handshake(&mut local).await?;
+    let (host, port) = local_socks6_read_connect(&mut local).await?;
     tracing::info!(target = %format!("{host}:{port}"), "CONNECT");
 
     // 2. Ограничить параллельные TLS к одному серверу (иначе при бурстах — tls handshake eof).
@@ -305,19 +305,19 @@ async fn handle_local_client(
             }
         };
 
-        socks5::reality::send_tunnel_auth(&mut tunnel, &config.secret, &config.short_id)
+        socks6::reality::send_tunnel_auth(&mut tunnel, &config.secret, &config.short_id)
             .await
             .context("Reality аутентификация")?;
 
-        remote_socks5_connect(&mut tunnel, &host, port, config.auth.as_ref())
+        remote_socks6_connect(&mut tunnel, &host, port, config.auth.as_ref())
             .await
-            .context("SOCKS5 через туннель")?;
+            .context("SOCKS6 через туннель")?;
 
         tunnel
     };
 
     // 5. Send CONNECT OK to local app
-    local_socks5_send_ok(&mut local).await?;
+    local_socks6_send_ok(&mut local).await?;
 
     // 6. Bidirectional relay
     let (up, down) = tokio::io::copy_bidirectional(&mut local, &mut tunnel).await?;
@@ -325,16 +325,16 @@ async fn handle_local_client(
     Ok(())
 }
 
-// ── Local SOCKS5 (client acts as server to local apps) ──────────────────
+// ── Local SOCKS6 (client acts as server to local apps) ──────────────────
 
-async fn local_socks5_handshake(stream: &mut TcpStream) -> Result<()> {
+async fn local_socks6_handshake(stream: &mut TcpStream) -> Result<()> {
     let mut hdr = [0u8; 2];
     stream
         .read_exact(&mut hdr)
         .await
-        .context("SOCKS5 greeting")?;
+        .context("SOCKS6 greeting")?;
     if hdr[0] != 0x05 {
-        bail!("не SOCKS5: {:#x}", hdr[0]);
+        bail!("не SOCKS6: {:#x}", hdr[0]);
     }
     let n = hdr[1] as usize;
     let mut methods = vec![0u8; n];
@@ -343,11 +343,11 @@ async fn local_socks5_handshake(stream: &mut TcpStream) -> Result<()> {
     Ok(())
 }
 
-async fn local_socks5_read_connect(stream: &mut TcpStream) -> Result<(String, u16)> {
+async fn local_socks6_read_connect(stream: &mut TcpStream) -> Result<(String, u16)> {
     let mut hdr = [0u8; 4];
     stream.read_exact(&mut hdr).await?;
     if hdr[0] != 0x05 || hdr[1] != 0x01 {
-        bail!("не SOCKS5 CONNECT: ver={:#x} cmd={:#x}", hdr[0], hdr[1]);
+        bail!("не SOCKS6 CONNECT: ver={:#x} cmd={:#x}", hdr[0], hdr[1]);
     }
     match hdr[3] {
         0x01 => {
@@ -374,17 +374,17 @@ async fn local_socks5_read_connect(stream: &mut TcpStream) -> Result<(String, u1
     }
 }
 
-async fn local_socks5_send_ok(stream: &mut TcpStream) -> Result<()> {
+async fn local_socks6_send_ok(stream: &mut TcpStream) -> Result<()> {
     stream
         .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await?;
-    stream.flush().await.context("flush SOCKS5 CONNECT OK")?;
+    stream.flush().await.context("flush SOCKS6 CONNECT OK")?;
     Ok(())
 }
 
-// ── Remote SOCKS5 (client talks to the server through tunnel) ───────────
+// ── Remote SOCKS6 (client talks to the server through tunnel) ───────────
 
-async fn remote_socks5_connect<S>(
+async fn remote_socks6_connect<S>(
     stream: &mut S,
     host: &str,
     port: u16,
@@ -402,7 +402,7 @@ where
     let mut choice = [0u8; 2];
     stream.read_exact(&mut choice).await?;
     if choice[0] != 0x05 {
-        bail!("сервер не SOCKS5: {:#x}", choice[0]);
+        bail!("сервер не SOCKS6: {:#x}", choice[0]);
     }
 
     match choice[1] {
@@ -449,7 +449,7 @@ where
     let mut reply = [0u8; 4];
     stream.read_exact(&mut reply).await?;
     if reply[0] != 0x05 {
-        bail!("невалидный SOCKS5 ответ: {:#x}", reply[0]);
+        bail!("невалидный SOCKS6 ответ: {:#x}", reply[0]);
     }
     if reply[1] != 0x00 {
         bail!("сервер CONNECT отклонён: {:#x}", reply[1]);

@@ -480,7 +480,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "socks5"
+name = "socks6"
 version = "2.1.1-alpha"
 dependencies = [
  "aes-gcm",

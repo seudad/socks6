@@ -10,7 +10,7 @@ pub struct Config {
     pub sni_spoof: Option<Arc<str>>,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
-    /// Разрешить на том же порту и plaintext SOCKS5 (первый байт 0x05), и TLS (0x16).
+    /// Разрешить на том же порту и plaintext SOCKS6 (первый байт 0x05), и TLS (0x16).
     pub tls_flex: bool,
     /// Суффиксы домена (например `apple.com`): для `host` на :443 не подменять SNI.
     pub sni_exclude: Vec<String>,
@@ -284,8 +284,8 @@ impl Config {
     }
 
     pub fn print_usage() {
-        eprintln!("SOCKS5 прокси-сервер с авторизацией, подменой SNI и Reality\n");
-        eprintln!("Использование: socks5 <АДРЕС:ПОРТ> [ОПЦИИ]\n");
+        eprintln!("SOCKS6 прокси-сервер с авторизацией, подменой SNI и Reality\n");
+        eprintln!("Использование: socks6 <АДРЕС:ПОРТ> [ОПЦИИ]\n");
         eprintln!("Опции:");
         eprintln!("  --auth <user:pass>               добавить пользователя (можно повторять)");
         eprintln!("  --auth-file <путь>               загрузить пользователей из файла");
@@ -294,7 +294,7 @@ impl Config {
         eprintln!("  --sni-exclude-file <путь>        загрузить суффиксы из файла");
         eprintln!("  --tls-cert <путь>                PEM-сертификат для TLS");
         eprintln!("  --tls-key  <путь>                PEM-ключ для TLS");
-        eprintln!("  --tls-flex                       принимать plaintext SOCKS5 и TLS на одном порту");
+        eprintln!("  --tls-flex                       принимать plaintext SOCKS6 и TLS на одном порту");
         eprintln!();
         eprintln!("Reality:");
         eprintln!("  --reality-dest <host:port>       cover-сервер для fallback (напр. www.google.com:443)");

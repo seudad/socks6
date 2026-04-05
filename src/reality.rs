@@ -180,7 +180,7 @@ pub fn verify_session_id(
 //
 // After the TLS handshake completes, the client sends a 28-byte auth frame
 // as the first message inside the tunnel. The server verifies it before
-// proceeding with SOCKS5. This avoids modifying the ClientHello (which
+// proceeding with SOCKS6. This avoids modifying the ClientHello (which
 // would break the TLS 1.3 transcript hash).
 //
 // Frame layout: short_id(8) | timestamp_be32(4) | tag(16) = 28 bytes
