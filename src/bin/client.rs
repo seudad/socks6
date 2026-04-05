@@ -6,6 +6,30 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls;
 use tokio_rustls::TlsConnector;
 
+// #region agent log
+fn dbg_agent_log(hypothesis_id: &str, location: &str, message: &str, data: &str) {
+    use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let line = format!(
+        "{{\"sessionId\":\"494c8d\",\"hypothesisId\":\"{}\",\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"timestamp\":{}}}",
+        esc(hypothesis_id),
+        esc(location),
+        esc(message),
+        data,
+        ts
+    );
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/Users/seeu/rust/socks5/.cursor/debug-494c8d.log")
+        .and_then(|mut f| writeln!(f, "{line}"));
+}
+// #endregion
+
 // ── Client config ───────────────────────────────────────────────────────
 
 struct ClientConfig {
@@ -147,7 +171,48 @@ async fn main() {
     }
 }
 
+/// Каждое SOCKS5-соединение держит отдельный сокет к приложению и отдельный TLS к серверу.
+/// При низком `ulimit -n` (часто 256 на macOS) получают EMFILE / «Too many open files».
+#[cfg(unix)]
+fn raise_nofile_limit() {
+    use libc::{getrlimit, rlimit, setrlimit, RLIMIT_NOFILE, RLIM_INFINITY};
+
+    const TARGET: libc::rlim_t = 512 * 1024;
+
+    unsafe {
+        let mut rlim = std::mem::MaybeUninit::<rlimit>::uninit();
+        if getrlimit(RLIMIT_NOFILE, rlim.as_mut_ptr()) != 0 {
+            return;
+        }
+        let cur = rlim.assume_init();
+        let hard = if cur.rlim_max == RLIM_INFINITY {
+            TARGET
+        } else {
+            cur.rlim_max
+        };
+        let new_cur = hard.min(TARGET);
+        if new_cur <= cur.rlim_cur {
+            return;
+        }
+        let new = rlimit {
+            rlim_cur: new_cur,
+            rlim_max: cur.rlim_max,
+        };
+        if setrlimit(RLIMIT_NOFILE, &new) == 0 {
+            tracing::info!(nofile_soft = new_cur, "RLIMIT_NOFILE повышен");
+        } else {
+            tracing::warn!(
+                "не удалось поднять RLIMIT_NOFILE; при ошибке EMFILE в shell: ulimit -n 65535"
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_nofile_limit() {}
+
 async fn run(config: ClientConfig) -> Result<()> {
+    raise_nofile_limit();
     let tls_config = build_tls_config()?;
     let listener = TcpListener::bind(config.listen).await?;
 
@@ -189,11 +254,35 @@ async fn handle_local_client(
     let (host, port) = local_socks5_read_connect(&mut local).await?;
     tracing::info!(target = %format!("{host}:{port}"), "CONNECT");
 
+    // #region agent log
+    {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let data = format!(
+            r#"{{"peer":"{}","target":"{}","target_port":{},"remote":"{}","sni":"{}"}}"#,
+            peer,
+            esc(&host),
+            port,
+            esc(&config.server),
+            esc(&config.server_name)
+        );
+        dbg_agent_log("H2", "client.rs:after_socks_connect", "SOCKS5 CONNECT parsed", &data);
+    }
+    // #endregion
+
     // 2. Connect to Reality server via TLS
     let tcp = TcpStream::connect(&config.server)
         .await
         .with_context(|| format!("TCP к {}", config.server))?;
     tcp.set_nodelay(true).ok();
+
+    // #region agent log
+    dbg_agent_log(
+        "H3",
+        "client.rs:tcp_ok",
+        "TCP connect to remote OK",
+        &format!(r#"{{"peer":"{}","remote":"{}"}}"#, peer, config.server),
+    );
+    // #endregion
 
     let connector = TlsConnector::from(tls_config);
     let name = rustls::pki_types::ServerName::try_from(config.server_name.clone())
@@ -201,6 +290,20 @@ async fn handle_local_client(
     let mut tunnel = connector
         .connect(name, tcp)
         .await
+        .map_err(|e| {
+            // #region agent log
+            let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+            let data = format!(
+                r#"{{"peer":"{}","remote":"{}","err":"{}","unexpected_eof":{}}}"#,
+                peer,
+                esc(&config.server),
+                esc(&e.to_string()),
+                e.to_string().to_lowercase().contains("eof")
+            );
+            dbg_agent_log("H1", "client.rs:tls_err", "TLS handshake error", &data);
+            // #endregion
+            e
+        })
         .context("TLS хендшейк")?;
 
     // 3. Send Reality auth inside TLS tunnel

@@ -5,3 +5,4 @@
 .cursor
 server.crt
 server.key
+systemd/
