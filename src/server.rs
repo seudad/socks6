@@ -215,7 +215,22 @@ async fn handle_reality_connection(
         .unwrap_or(false);
 
     if !sni_ok {
-        tracing::info!(%peer, sni = ?fields.sni, "Reality: SNI не в списке, fallback → {dest}");
+        match &fields.sni {
+            None => {
+                tracing::info!(
+                    %peer,
+                    "Reality: в ClientHello нет server_name (или расширение не распознано), fallback → {dest}"
+                );
+            }
+            Some(s) => {
+                tracing::info!(
+                    %peer,
+                    received = %s,
+                    allowed = ?config.reality_server_names,
+                    "Reality: SNI не входит в --reality-server-names, fallback → {dest}"
+                );
+            }
+        }
         reality::fallback_relay(stream, ch_buf, dest).await.ok();
         return Ok(());
     }
