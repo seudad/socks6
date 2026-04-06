@@ -201,10 +201,17 @@ async fn handle_reality_connection(
         }
     };
 
+    // Сравнение без учёта регистра: в ClientHello SNI часто в смешанном регистре.
     let sni_ok = fields
         .sni
         .as_ref()
-        .map(|s| config.reality_server_names.iter().any(|n| n == s))
+        .map(|s| {
+            let sl = s.to_ascii_lowercase();
+            config
+                .reality_server_names
+                .iter()
+                .any(|n| *n == sl)
+        })
         .unwrap_or(false);
 
     if !sni_ok {
@@ -246,11 +253,11 @@ async fn handle_reality_connection(
             handle_client(tls_stream, peer, config).await
         }
         Ok(Err(e)) => {
-            tracing::info!(%peer, "Reality: auth failed: {e:#}");
+            tracing::warn!(%peer, "Reality: auth failed: {e:#}");
             Ok(())
         }
         Err(_) => {
-            tracing::info!(%peer, "Reality: auth таймаут");
+            tracing::warn!(%peer, "Reality: auth таймаут (проверьте secret, short-id и время на сервере/клиенте)");
             Ok(())
         }
     }

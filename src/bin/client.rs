@@ -137,7 +137,7 @@ impl ClientConfig {
         eprintln!("Reality SOCKS6 клиент\n");
         eprintln!("Использование: socks6-client [ОПЦИИ]\n");
         eprintln!("Опции:");
-        eprintln!("  --listen, -l <addr>      локальный адрес (по умолчанию 127.0.0.1:1080)");
+        eprintln!("  --listen, -l <addr>      локальный адрес (по умолчанию 127.0.0.1:1080; iPhone/LAN: 0.0.0.0:1080)");
         eprintln!("  --server, -s <addr>      адрес Reality сервера (host:port)");
         eprintln!("  --server-name <domain>   SNI для TLS (напр. www.google.com)");
         eprintln!("  --secret <base64>        общий секрет Reality");
@@ -217,6 +217,12 @@ fn raise_nofile_limit() {}
 
 async fn run(config: ClientConfig) -> Result<()> {
     raise_nofile_limit();
+    if config.listen.ip().is_loopback() {
+        tracing::warn!(
+            addr = %config.listen,
+            "слушаем только loopback — с телефона/LAN не подключиться; задайте --listen 0.0.0.0:1080"
+        );
+    }
     let tls_config = build_tls_config()?;
     let listener = TcpListener::bind(config.listen).await?;
 
@@ -259,8 +265,11 @@ async fn handle_local_client(
 ) -> Result<()> {
     // 1. Accept SOCKS6 from local app
     local_socks6_handshake(&mut local).await?;
+    tracing::debug!(%peer, "шаг 1/6: с телефона SOCKS приветствие OK");
+
     let (host, port) = local_socks6_read_connect(&mut local).await?;
     tracing::info!(target = %format!("{host}:{port}"), "CONNECT");
+    tracing::debug!(%peer, host = %host, port, "шаг 2/6: запрошен CONNECT");
 
     // 2. Ограничить параллельные TLS к одному серверу (иначе при бурстах — tls handshake eof).
     let mut tunnel = {
@@ -268,6 +277,7 @@ async fn handle_local_client(
             .acquire()
             .await
             .context("TLS: семафор закрыт")?;
+        tracing::debug!(%peer, "шаг 3/6: слот TLS к VPS взят");
 
         let connector = TlsConnector::from(tls_config);
         const MAX_TLS_HANDSHAKE_TRIES: u32 = 3;
@@ -278,6 +288,7 @@ async fn handle_local_client(
                 .await
                 .with_context(|| format!("TCP к {}", config.server))?;
             tcp.set_nodelay(true).ok();
+            tracing::debug!(%peer, attempt, "шаг 4a: TCP до VPS установлен");
 
             let name = rustls::pki_types::ServerName::try_from(config.server_name.clone())
                 .context("невалидный SNI")?;
@@ -286,6 +297,7 @@ async fn handle_local_client(
                     if attempt > 1 {
                         tracing::debug!(%peer, attempt, "TLS: успех после повтора");
                     }
+                    tracing::debug!(%peer, "шаг 4b: TLS к VPS готов");
                     break t;
                 }
                 Err(e) => {
@@ -307,17 +319,20 @@ async fn handle_local_client(
 
         socks6::reality::send_tunnel_auth(&mut tunnel, &config.secret, &config.short_id)
             .await
-            .context("Reality аутентификация")?;
+            .context("Reality аутентификация (если отказ: secret/short-id или часы на Mac и VPS)")?;
+        tracing::debug!(%peer, "шаг 5/6: Reality auth к VPS OK");
 
         remote_socks6_connect(&mut tunnel, &host, port, config.auth.as_ref())
             .await
             .context("SOCKS6 через туннель")?;
+        tracing::debug!(%peer, "шаг 6/6: на VPS удалённый CONNECT OK");
 
         tunnel
     };
 
     // 5. Send CONNECT OK to local app
     local_socks6_send_ok(&mut local).await?;
+    tracing::debug!(%peer, "ответ CONNECT отправлен телефону, релей");
 
     // 6. Bidirectional relay
     let (up, down) = tokio::io::copy_bidirectional(&mut local, &mut tunnel).await?;
@@ -328,6 +343,10 @@ async fn handle_local_client(
 // ── Local SOCKS6 (client acts as server to local apps) ──────────────────
 
 async fn local_socks6_handshake(stream: &mut TcpStream) -> Result<()> {
+    /// RFC 1928: сервер должен выбрать метод из списка клиента (или 0xFF).
+    const AUTH_NONE: u8 = 0x00;
+    const AUTH_REJECT: u8 = 0xff;
+
     let mut hdr = [0u8; 2];
     stream
         .read_exact(&mut hdr)
@@ -339,7 +358,15 @@ async fn local_socks6_handshake(stream: &mut TcpStream) -> Result<()> {
     let n = hdr[1] as usize;
     let mut methods = vec![0u8; n];
     stream.read_exact(&mut methods).await?;
-    stream.write_all(&[0x05, 0x00]).await?;
+    if methods.contains(&AUTH_NONE) {
+        stream.write_all(&[0x05, AUTH_NONE]).await?;
+        stream.flush().await.context("flush после выбора метода SOCKS")?;
+    } else {
+        stream.write_all(&[0x05, AUTH_REJECT]).await?;
+        bail!(
+            "клиент не предложил метод «без аутентификации»; в Shadowrocket для этого узла отключите user/password"
+        );
+    }
     Ok(())
 }
 
@@ -439,8 +466,12 @@ where
         req.push(0x04);
         req.extend_from_slice(&v6.octets());
     } else {
+        let len = host.len();
+        if len > 255 {
+            bail!("имя хоста для SOCKS длиннее 255 байт");
+        }
         req.push(0x03);
-        req.push(host.len() as u8);
+        req.push(len as u8);
         req.extend_from_slice(host.as_bytes());
     }
     req.extend_from_slice(&port.to_be_bytes());
@@ -469,7 +500,7 @@ where
             let mut skip = [0u8; 18];
             stream.read_exact(&mut skip).await?;
         }
-        _ => {}
+        atyp => bail!("SOCKS CONNECT OK: неизвестный ATYP в ответе сервера: {atyp:#x}"),
     }
 
     Ok(())
