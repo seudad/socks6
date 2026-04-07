@@ -5,6 +5,7 @@ use aes_gcm::{
 use anyhow::{bail, Context, Result};
 use hkdf::Hkdf;
 use sha2::Sha256;
+use std::fmt;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
@@ -234,6 +235,37 @@ pub fn verify_session_id(
 pub const TUNNEL_AUTH_LEN: usize = 28;
 const TUNNEL_AUTH_OK: [u8; 2] = [0x00, 0x52]; // "R"
 
+/// Причина отклонения кадра Reality-туннеля (для логов на сервере).
+#[derive(Debug, Clone)]
+pub enum TunnelAuthReject {
+    UnknownShortId,
+    ClockSkew {
+        client_ts: u32,
+        server_now: u32,
+        diff_sec: u64,
+        max_sec: u64,
+    },
+    BadTag,
+}
+
+impl fmt::Display for TunnelAuthReject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownShortId => write!(f, "short_id не в списке разрешённых"),
+            Self::ClockSkew {
+                client_ts,
+                server_now,
+                diff_sec,
+                max_sec,
+            } => write!(
+                f,
+                "расхождение времени: клиент unix_ts={client_ts}, сервер unix_ts={server_now}, |Δ|={diff_sec}s, лимит={max_sec}s (синхронизируйте NTP или увеличьте --reality-max-time-diff; на клиенте при необходимости --auth-time-offset)"
+            ),
+            Self::BadTag => write!(f, "неверный HMAC-тег (проверьте --reality-secret)"),
+        }
+    }
+}
+
 fn compute_auth_tag(secret: &[u8; 32], short_id: &[u8; 8], ts_bytes: &[u8; 4]) -> [u8; 16] {
     let mut salt = [0u8; 12];
     salt[..8].copy_from_slice(short_id);
@@ -245,11 +277,22 @@ fn compute_auth_tag(secret: &[u8; 32], short_id: &[u8; 8], ts_bytes: &[u8; 4]) -
     tag
 }
 
-pub fn build_tunnel_auth(secret: &[u8; 32], short_id: &[u8; 8]) -> [u8; TUNNEL_AUTH_LEN] {
-    let ts = std::time::SystemTime::now()
+fn unix_ts_with_offset(offset_secs: i64) -> u32 {
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() as u32;
+        .as_secs() as i64;
+    now.saturating_add(offset_secs)
+        .clamp(0, u32::MAX as i64) as u32
+}
+
+/// Кадр аутентификации туннеля. `time_offset_secs` — сдвиг к unix-времени клиента (если часы не синхронизированы).
+pub fn build_tunnel_auth_with_offset(
+    secret: &[u8; 32],
+    short_id: &[u8; 8],
+    time_offset_secs: i64,
+) -> [u8; TUNNEL_AUTH_LEN] {
+    let ts = unix_ts_with_offset(time_offset_secs);
     let ts_bytes = ts.to_be_bytes();
     let tag = compute_auth_tag(secret, short_id, &ts_bytes);
 
@@ -260,17 +303,21 @@ pub fn build_tunnel_auth(secret: &[u8; 32], short_id: &[u8; 8]) -> [u8; TUNNEL_A
     frame
 }
 
-pub fn verify_tunnel_auth(
+pub fn build_tunnel_auth(secret: &[u8; 32], short_id: &[u8; 8]) -> [u8; TUNNEL_AUTH_LEN] {
+    build_tunnel_auth_with_offset(secret, short_id, 0)
+}
+
+pub fn verify_tunnel_auth_detailed(
     frame: &[u8; TUNNEL_AUTH_LEN],
     secret: &[u8; 32],
     allowed_short_ids: &[[u8; 8]],
     max_time_diff: u64,
-) -> Option<[u8; 8]> {
+) -> Result<[u8; 8], TunnelAuthReject> {
     let mut short_id = [0u8; 8];
     short_id.copy_from_slice(&frame[..8]);
 
     if !allowed_short_ids.contains(&short_id) {
-        return None;
+        return Err(TunnelAuthReject::UnknownShortId);
     }
 
     let ts = u32::from_be_bytes([frame[8], frame[9], frame[10], frame[11]]);
@@ -278,18 +325,33 @@ pub fn verify_tunnel_auth(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as u32;
-    if now.abs_diff(ts) as u64 > max_time_diff {
-        return None;
+    let diff = now.abs_diff(ts) as u64;
+    if diff > max_time_diff {
+        return Err(TunnelAuthReject::ClockSkew {
+            client_ts: ts,
+            server_now: now,
+            diff_sec: diff,
+            max_sec: max_time_diff,
+        });
     }
 
     let ts_bytes: [u8; 4] = [frame[8], frame[9], frame[10], frame[11]];
     let expected = compute_auth_tag(secret, &short_id, &ts_bytes);
 
     if frame[12..28] != expected {
-        return None;
+        return Err(TunnelAuthReject::BadTag);
     }
 
-    Some(short_id)
+    Ok(short_id)
+}
+
+pub fn verify_tunnel_auth(
+    frame: &[u8; TUNNEL_AUTH_LEN],
+    secret: &[u8; 32],
+    allowed_short_ids: &[[u8; 8]],
+    max_time_diff: u64,
+) -> Option<[u8; 8]> {
+    verify_tunnel_auth_detailed(frame, secret, allowed_short_ids, max_time_diff).ok()
 }
 
 /// Send the auth frame + read the 2-byte ACK inside a TLS tunnel.
@@ -297,8 +359,9 @@ pub async fn send_tunnel_auth<S: AsyncWrite + AsyncRead + Unpin>(
     stream: &mut S,
     secret: &[u8; 32],
     short_id: &[u8; 8],
+    time_offset_secs: i64,
 ) -> Result<()> {
-    let frame = build_tunnel_auth(secret, short_id);
+    let frame = build_tunnel_auth_with_offset(secret, short_id, time_offset_secs);
     stream.write_all(&frame).await.context("send auth frame")?;
     let mut ack = [0u8; 2];
     stream.read_exact(&mut ack).await.context("read auth ACK")?;
@@ -321,13 +384,13 @@ pub async fn recv_and_verify_tunnel_auth<S: AsyncRead + AsyncWrite + Unpin>(
         .read_exact(&mut frame)
         .await
         .context("read auth frame")?;
-    match verify_tunnel_auth(&frame, secret, allowed_short_ids, max_time_diff) {
-        Some(short_id) => {
+    match verify_tunnel_auth_detailed(&frame, secret, allowed_short_ids, max_time_diff) {
+        Ok(short_id) => {
             stream.write_all(&TUNNEL_AUTH_OK).await?;
             Ok(short_id)
         }
-        None => {
-            bail!("Reality: невалидная аутентификация");
+        Err(e) => {
+            bail!("Reality: {}", e);
         }
     }
 }

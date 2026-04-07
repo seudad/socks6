@@ -21,6 +21,8 @@ struct ClientConfig {
     auth: Option<(String, String)>,
     /// Макс. одновременных установок TLS к серверу (остальные ждут в очереди).
     max_tls_parallel: usize,
+    /// Сдвиг unix-времени в кадре Reality-auth (если часы клиента впереди/позади сервера).
+    auth_time_offset_secs: i64,
 }
 
 impl ClientConfig {
@@ -33,6 +35,7 @@ impl ClientConfig {
         let mut short_id: Option<[u8; 8]> = None;
         let mut auth: Option<(String, String)> = None;
         let mut max_tls_parallel: Option<usize> = None;
+        let mut auth_time_offset_secs: Option<i64> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -103,6 +106,15 @@ impl ClientConfig {
                             .context("--max-tls: невалидное число")?,
                     );
                 }
+                "--auth-time-offset" => {
+                    i += 1;
+                    auth_time_offset_secs = Some(
+                        args.get(i)
+                            .context("--auth-time-offset требует секунды (можно отрицательные)")?
+                            .parse()
+                            .context("--auth-time-offset: невалидное число")?,
+                    );
+                }
                 "-h" | "--help" => {
                     Self::print_usage();
                     std::process::exit(0);
@@ -123,6 +135,14 @@ impl ClientConfig {
             bail!("--max-tls / SOCKS6_CLIENT_MAX_TLS должен быть >= 1");
         }
 
+        let auth_time_offset_secs = auth_time_offset_secs
+            .or_else(|| {
+                std::env::var("SOCKS6_AUTH_TIME_OFFSET_SECS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(0);
+
         Ok(ClientConfig {
             listen: listen.unwrap_or_else(|| "127.0.0.1:1080".parse().unwrap()),
             server: server.context("--server обязателен")?,
@@ -131,6 +151,7 @@ impl ClientConfig {
             short_id: short_id.context("--short-id обязателен")?,
             auth,
             max_tls_parallel,
+            auth_time_offset_secs,
         })
     }
 
@@ -145,6 +166,7 @@ impl ClientConfig {
         eprintln!("  --short-id <hex>         Short ID (16 hex символов)");
         eprintln!("  --auth <user:pass>       авторизация на сервере (если включена)");
         eprintln!("  --max-tls <N>            одновременных TLS к серверу (по умолчанию 12; env SOCKS6_CLIENT_MAX_TLS)");
+        eprintln!("  --auth-time-offset <сек> сдвиг времени в Reality-auth (+если часы Mac отстают; env SOCKS6_AUTH_TIME_OFFSET_SECS)");
         eprintln!("  -h, --help               показать справку");
     }
 }
@@ -232,6 +254,7 @@ async fn run(config: ClientConfig) -> Result<()> {
         server = %config.server,
         sni = %config.server_name,
         max_tls = config.max_tls_parallel,
+        auth_time_offset_secs = config.auth_time_offset_secs,
         "Reality клиент запущен"
     );
 
@@ -366,9 +389,16 @@ async fn handle_local_client(
             }
         };
 
-        socks6::reality::send_tunnel_auth(&mut tunnel, &config.secret, &config.short_id)
-            .await
-            .context("Reality аутентификация (если отказ: secret/short-id или часы на Mac и VPS)")?;
+        socks6::reality::send_tunnel_auth(
+            &mut tunnel,
+            &config.secret,
+            &config.short_id,
+            config.auth_time_offset_secs,
+        )
+        .await
+        .context(
+            "Reality аутентификация (см. лог VPS: расхождение времени → NTP или --auth-time-offset)",
+        )?;
         tracing::debug!(%peer, "шаг 5/6: Reality auth к VPS OK");
 
         remote_socks6_connect(&mut tunnel, &host, port, config.auth.as_ref())
