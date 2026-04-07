@@ -23,7 +23,7 @@ pub struct Config {
     pub reality_short_ids: Vec<[u8; 8]>,
     /// Allowed SNI values from clients.
     pub reality_server_names: Vec<String>,
-    /// Max clock skew in seconds (default 120).
+    /// Max |client−server| time for tunnel auth frame (default 3600 s).
     pub reality_max_time_diff: u64,
 }
 
@@ -61,7 +61,7 @@ impl Config {
         let mut reality_secret: Option<[u8; 32]> = None;
         let mut reality_short_ids: Vec<[u8; 8]> = Vec::new();
         let mut reality_server_names: Vec<String> = Vec::new();
-        let mut reality_max_time_diff: u64 = 120;
+        let mut reality_max_time_diff: u64 = 3600;
 
         let mut i = 0;
         while i < args.len() {
@@ -301,7 +301,7 @@ impl Config {
         eprintln!("  --reality-secret <base64>        общий секрет (32 байта)");
         eprintln!("  --reality-short-id <hex>         разрешённый Short ID (16 hex, можно повторять)");
         eprintln!("  --reality-server-names <a,b,...>  допустимые SNI через запятую");
-        eprintln!("  --reality-max-time-diff <сек>    макс. расхождение часов (по умолчанию 120)");
+        eprintln!("  --reality-max-time-diff <сек>    допуск времени для Reality-auth (по умолчанию 3600)");
         eprintln!("  --reality-generate-keys          сгенерировать secret + short-id и выйти");
         eprintln!();
         eprintln!("  -h, --help                       показать справку");

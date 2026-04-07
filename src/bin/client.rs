@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
+use tokio::time::timeout;
 use tokio_rustls::rustls;
 use tokio_rustls::TlsConnector;
 
@@ -20,6 +21,8 @@ struct ClientConfig {
     auth: Option<(String, String)>,
     /// Макс. одновременных установок TLS к серверу (остальные ждут в очереди).
     max_tls_parallel: usize,
+    /// Сдвиг unix-времени в кадре Reality-auth (если часы клиента впереди/позади сервера).
+    auth_time_offset_secs: i64,
 }
 
 impl ClientConfig {
@@ -32,6 +35,7 @@ impl ClientConfig {
         let mut short_id: Option<[u8; 8]> = None;
         let mut auth: Option<(String, String)> = None;
         let mut max_tls_parallel: Option<usize> = None;
+        let mut auth_time_offset_secs: Option<i64> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -102,6 +106,15 @@ impl ClientConfig {
                             .context("--max-tls: невалидное число")?,
                     );
                 }
+                "--auth-time-offset" => {
+                    i += 1;
+                    auth_time_offset_secs = Some(
+                        args.get(i)
+                            .context("--auth-time-offset требует секунды (можно отрицательные)")?
+                            .parse()
+                            .context("--auth-time-offset: невалидное число")?,
+                    );
+                }
                 "-h" | "--help" => {
                     Self::print_usage();
                     std::process::exit(0);
@@ -122,6 +135,14 @@ impl ClientConfig {
             bail!("--max-tls / SOCKS6_CLIENT_MAX_TLS должен быть >= 1");
         }
 
+        let auth_time_offset_secs = auth_time_offset_secs
+            .or_else(|| {
+                std::env::var("SOCKS6_AUTH_TIME_OFFSET_SECS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(0);
+
         Ok(ClientConfig {
             listen: listen.unwrap_or_else(|| "127.0.0.1:1080".parse().unwrap()),
             server: server.context("--server обязателен")?,
@@ -130,6 +151,7 @@ impl ClientConfig {
             short_id: short_id.context("--short-id обязателен")?,
             auth,
             max_tls_parallel,
+            auth_time_offset_secs,
         })
     }
 
@@ -144,6 +166,7 @@ impl ClientConfig {
         eprintln!("  --short-id <hex>         Short ID (16 hex символов)");
         eprintln!("  --auth <user:pass>       авторизация на сервере (если включена)");
         eprintln!("  --max-tls <N>            одновременных TLS к серверу (по умолчанию 12; env SOCKS6_CLIENT_MAX_TLS)");
+        eprintln!("  --auth-time-offset <сек> сдвиг времени в Reality-auth (+если часы Mac отстают; env SOCKS6_AUTH_TIME_OFFSET_SECS)");
         eprintln!("  -h, --help               показать справку");
     }
 }
@@ -231,6 +254,7 @@ async fn run(config: ClientConfig) -> Result<()> {
         server = %config.server,
         sni = %config.server_name,
         max_tls = config.max_tls_parallel,
+        auth_time_offset_secs = config.auth_time_offset_secs,
         "Reality клиент запущен"
     );
 
@@ -281,26 +305,54 @@ async fn handle_local_client(
 
         let connector = TlsConnector::from(tls_config);
         const MAX_TLS_HANDSHAKE_TRIES: u32 = 3;
+        const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+        const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(25);
         let mut attempt: u32 = 0;
         let mut tunnel = loop {
             attempt += 1;
-            let tcp = TcpStream::connect(&config.server)
-                .await
-                .with_context(|| format!("TCP к {}", config.server))?;
+            let tcp = match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(&config.server)).await {
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "TCP к {} (нет SYN/ответа сервера или отказ)",
+                            config.server
+                        )
+                    });
+                }
+                Err(_) => {
+                    bail!(
+                        "TCP к {}: таймаут {} с. Проверьте IP/порт, ufw на VPS, доступ с Mac (ping/маршрут не обязателен для TCP), VPN на Mac",
+                        config.server,
+                        TCP_CONNECT_TIMEOUT.as_secs()
+                    );
+                }
+            };
             tcp.set_nodelay(true).ok();
-            tracing::debug!(%peer, attempt, "шаг 4a: TCP до VPS установлен");
+            let tcp_local = tcp.local_addr().ok();
+            let tcp_peer = tcp.peer_addr().ok();
+            tracing::info!(
+                %peer,
+                attempt,
+                target = %config.server,
+                ?tcp_local,
+                ?tcp_peer,
+                "TCP сессия открыта: проверьте, что tcp_peer — ваш VPS:порт; если там другой IP — неверный аргумент -s или подмена в /etc/hosts"
+            );
+            tracing::debug!(%peer, attempt, server = %config.server, "шаг 4a: TCP до VPS установлен");
 
             let name = rustls::pki_types::ServerName::try_from(config.server_name.clone())
                 .context("невалидный SNI")?;
-            match connector.connect(name, tcp).await {
-                Ok(t) => {
+            tracing::debug!(%peer, sni = %config.server_name, "шаг 4a→4b: старт TLS ClientHello к VPS");
+            match timeout(TLS_HANDSHAKE_TIMEOUT, connector.connect(name, tcp)).await {
+                Ok(Ok(t)) => {
                     if attempt > 1 {
                         tracing::debug!(%peer, attempt, "TLS: успех после повтора");
                     }
                     tracing::debug!(%peer, "шаг 4b: TLS к VPS готов");
                     break t;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let retriable = matches!(
                         e.kind(),
                         ErrorKind::UnexpectedEof
@@ -312,14 +364,41 @@ async fn handle_local_client(
                         tokio::time::sleep(Duration::from_millis(40 + 60 * attempt as u64)).await;
                         continue;
                     }
-                    return Err(e).context("TLS хендшейк");
+                    tracing::warn!(
+                        %peer,
+                        err = %e,
+                        server = %config.server,
+                        sni = %config.server_name,
+                        "TLS к VPS не завершился после TCP (часто: SNI не в --reality-server-names → на VPS fallback на reality-dest и «чужой» TLS; или не тот порт/сервис). Смотрите логи socks6 на VPS: «SNI не в списке», «невалидный ClientHello»."
+                    );
+                    return Err(e).context("TLS хендшейк к VPS");
+                }
+                Err(_) => {
+                    let msg = format!(
+                        "TLS к {}: таймаут {} с после TCP (нет ServerHello). На этом host:port слушает не ваш socks6/TLS, пакеты режутся, или процесс на VPS не тот",
+                        config.server,
+                        TLS_HANDSHAKE_TIMEOUT.as_secs()
+                    );
+                    tracing::warn!(%peer, %attempt, "{}", msg);
+                    if attempt < MAX_TLS_HANDSHAKE_TRIES {
+                        tokio::time::sleep(Duration::from_millis(40 + 60 * attempt as u64)).await;
+                        continue;
+                    }
+                    bail!("{}", msg);
                 }
             }
         };
 
-        socks6::reality::send_tunnel_auth(&mut tunnel, &config.secret, &config.short_id)
-            .await
-            .context("Reality аутентификация (если отказ: secret/short-id или часы на Mac и VPS)")?;
+        socks6::reality::send_tunnel_auth(
+            &mut tunnel,
+            &config.secret,
+            &config.short_id,
+            config.auth_time_offset_secs,
+        )
+        .await
+        .context(
+            "Reality аутентификация (см. лог VPS: расхождение времени → NTP или --auth-time-offset)",
+        )?;
         tracing::debug!(%peer, "шаг 5/6: Reality auth к VPS OK");
 
         remote_socks6_connect(&mut tunnel, &host, port, config.auth.as_ref())

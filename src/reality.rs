@@ -5,6 +5,7 @@ use aes_gcm::{
 use anyhow::{bail, Context, Result};
 use hkdf::Hkdf;
 use sha2::Sha256;
+use std::fmt;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
@@ -21,61 +22,77 @@ pub struct ClientHelloFields {
 }
 
 /// Parse a raw TLS record containing a ClientHello.
-/// Layout: record_hdr(5) + hs_type(1) + hs_len(3) + version(2) + random(32) + sid_len(1) …
+/// Учитывает длину handshake из заголовка: не читаем за пределы тела ClientHello (паддинг записи и т.д.).
+///
+/// Layout: record_hdr(5) + hs_type(1) + hs_len(3) + body: version(2) + random(32) + sid_len(1) + sid + …
 pub fn parse_client_hello(buf: &[u8]) -> Option<ClientHelloFields> {
-    if buf.len() < 44 || buf[0] != 0x16 || buf[5] != 0x01 {
+    const REC: usize = 5;
+    const HS_HDR: usize = 4;
+    if buf.len() < REC + HS_HDR + 2 + 32 + 1 || buf[0] != 0x16 || buf[5] != 0x01 {
         return None;
     }
 
+    let hs_len = u32::from_be_bytes([0, buf[6], buf[7], buf[8]]) as usize;
+    let ch_start = REC + HS_HDR;
+    let ch_end = ch_start.checked_add(hs_len)?;
+    if ch_end > buf.len() {
+        return None;
+    }
+
+    if ch_start + 2 + 32 + 1 > ch_end {
+        return None;
+    }
     let mut random = [0u8; 32];
-    random.copy_from_slice(&buf[11..43]);
+    random.copy_from_slice(&buf[ch_start + 2..ch_start + 34]);
 
-    let sid_len = buf[43] as usize;
-    if buf.len() < 44 + sid_len {
+    let sid_len = buf[ch_start + 34] as usize;
+    let session_id_offset = ch_start + 35;
+    if session_id_offset + sid_len > ch_end {
         return None;
     }
-    let session_id_offset = 44;
     let session_id = buf[session_id_offset..session_id_offset + sid_len].to_vec();
 
-    let mut pos = 44 + sid_len;
-
-    if pos + 2 > buf.len() {
+    let mut pos = session_id_offset + sid_len;
+    if pos + 2 > ch_end {
         return None;
     }
     let cs_len = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
-    pos += 2 + cs_len;
+    pos += 2;
+    if pos + cs_len > ch_end {
+        return None;
+    }
+    pos += cs_len;
 
-    if pos >= buf.len() {
+    if pos >= ch_end {
         return None;
     }
     let comp_len = buf[pos] as usize;
-    pos += 1 + comp_len;
+    pos += 1;
+    if pos + comp_len > ch_end {
+        return None;
+    }
+    pos += comp_len;
 
-    let sni = if pos + 2 <= buf.len() {
+    let sni = if pos + 2 <= ch_end {
         let ext_all_len = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
         pos += 2;
-        let ext_end = pos + ext_all_len;
+        let ext_end = pos.checked_add(ext_all_len)?;
+        if ext_end > ch_end {
+            return None;
+        }
 
         let mut found_sni = None;
-        while pos + 4 <= ext_end && pos + 4 <= buf.len() {
+        while pos + 4 <= ext_end {
             let ext_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
             let ext_len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
             let ext_data = pos + 4;
-
-            if ext_type == 0x0000 && ext_len >= 5 && ext_data + 5 <= buf.len() {
-                if buf[ext_data + 2] == 0x00 {
-                    let name_len =
-                        u16::from_be_bytes([buf[ext_data + 3], buf[ext_data + 4]]) as usize;
-                    let name_start = ext_data + 5;
-                    if name_start + name_len <= buf.len() {
-                        found_sni = Some(
-                            String::from_utf8_lossy(&buf[name_start..name_start + name_len])
-                                .into_owned(),
-                        );
-                    }
-                }
+            if ext_data.saturating_add(ext_len) > ext_end {
+                break;
             }
 
+            if ext_type == 0x0000 && ext_len >= 2 {
+                parse_sni_extension_data(&buf[ext_data..ext_data + ext_len], &mut found_sni);
+            }
             pos = ext_data + ext_len;
         }
         found_sni
@@ -89,6 +106,35 @@ pub fn parse_client_hello(buf: &[u8]) -> Option<ClientHelloFields> {
         session_id_offset,
         sni,
     })
+}
+
+/// RFC 6066: extension_data = ServerNameList (ushort len + один или несколько ServerName).
+fn parse_sni_extension_data(data: &[u8], out: &mut Option<String>) {
+    if out.is_some() || data.len() < 2 {
+        return;
+    }
+    let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    if 2 + list_len > data.len() {
+        return;
+    }
+
+    let mut inner = 2usize;
+    let list_end = 2 + list_len;
+    while inner + 3 <= list_end && inner + 3 <= data.len() {
+        let name_type = data[inner];
+        let name_len = u16::from_be_bytes([data[inner + 1], data[inner + 2]]) as usize;
+        let name_start = inner + 3;
+        if name_start + name_len > list_end || name_start + name_len > data.len() {
+            break;
+        }
+        if name_type == 0x00 {
+            *out = Some(
+                String::from_utf8_lossy(&data[name_start..name_start + name_len]).into_owned(),
+            );
+            return;
+        }
+        inner = name_start + name_len;
+    }
 }
 
 // ── Reality crypto ──────────────────────────────────────────────────────
@@ -189,6 +235,37 @@ pub fn verify_session_id(
 pub const TUNNEL_AUTH_LEN: usize = 28;
 const TUNNEL_AUTH_OK: [u8; 2] = [0x00, 0x52]; // "R"
 
+/// Причина отклонения кадра Reality-туннеля (для логов на сервере).
+#[derive(Debug, Clone)]
+pub enum TunnelAuthReject {
+    UnknownShortId,
+    ClockSkew {
+        client_ts: u32,
+        server_now: u32,
+        diff_sec: u64,
+        max_sec: u64,
+    },
+    BadTag,
+}
+
+impl fmt::Display for TunnelAuthReject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownShortId => write!(f, "short_id не в списке разрешённых"),
+            Self::ClockSkew {
+                client_ts,
+                server_now,
+                diff_sec,
+                max_sec,
+            } => write!(
+                f,
+                "расхождение времени: клиент unix_ts={client_ts}, сервер unix_ts={server_now}, |Δ|={diff_sec}s, лимит={max_sec}s (синхронизируйте NTP или увеличьте --reality-max-time-diff; на клиенте при необходимости --auth-time-offset)"
+            ),
+            Self::BadTag => write!(f, "неверный HMAC-тег (проверьте --reality-secret)"),
+        }
+    }
+}
+
 fn compute_auth_tag(secret: &[u8; 32], short_id: &[u8; 8], ts_bytes: &[u8; 4]) -> [u8; 16] {
     let mut salt = [0u8; 12];
     salt[..8].copy_from_slice(short_id);
@@ -200,11 +277,22 @@ fn compute_auth_tag(secret: &[u8; 32], short_id: &[u8; 8], ts_bytes: &[u8; 4]) -
     tag
 }
 
-pub fn build_tunnel_auth(secret: &[u8; 32], short_id: &[u8; 8]) -> [u8; TUNNEL_AUTH_LEN] {
-    let ts = std::time::SystemTime::now()
+fn unix_ts_with_offset(offset_secs: i64) -> u32 {
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() as u32;
+        .as_secs() as i64;
+    now.saturating_add(offset_secs)
+        .clamp(0, u32::MAX as i64) as u32
+}
+
+/// Кадр аутентификации туннеля. `time_offset_secs` — сдвиг к unix-времени клиента (если часы не синхронизированы).
+pub fn build_tunnel_auth_with_offset(
+    secret: &[u8; 32],
+    short_id: &[u8; 8],
+    time_offset_secs: i64,
+) -> [u8; TUNNEL_AUTH_LEN] {
+    let ts = unix_ts_with_offset(time_offset_secs);
     let ts_bytes = ts.to_be_bytes();
     let tag = compute_auth_tag(secret, short_id, &ts_bytes);
 
@@ -215,17 +303,21 @@ pub fn build_tunnel_auth(secret: &[u8; 32], short_id: &[u8; 8]) -> [u8; TUNNEL_A
     frame
 }
 
-pub fn verify_tunnel_auth(
+pub fn build_tunnel_auth(secret: &[u8; 32], short_id: &[u8; 8]) -> [u8; TUNNEL_AUTH_LEN] {
+    build_tunnel_auth_with_offset(secret, short_id, 0)
+}
+
+pub fn verify_tunnel_auth_detailed(
     frame: &[u8; TUNNEL_AUTH_LEN],
     secret: &[u8; 32],
     allowed_short_ids: &[[u8; 8]],
     max_time_diff: u64,
-) -> Option<[u8; 8]> {
+) -> Result<[u8; 8], TunnelAuthReject> {
     let mut short_id = [0u8; 8];
     short_id.copy_from_slice(&frame[..8]);
 
     if !allowed_short_ids.contains(&short_id) {
-        return None;
+        return Err(TunnelAuthReject::UnknownShortId);
     }
 
     let ts = u32::from_be_bytes([frame[8], frame[9], frame[10], frame[11]]);
@@ -233,18 +325,33 @@ pub fn verify_tunnel_auth(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as u32;
-    if now.abs_diff(ts) as u64 > max_time_diff {
-        return None;
+    let diff = now.abs_diff(ts) as u64;
+    if diff > max_time_diff {
+        return Err(TunnelAuthReject::ClockSkew {
+            client_ts: ts,
+            server_now: now,
+            diff_sec: diff,
+            max_sec: max_time_diff,
+        });
     }
 
     let ts_bytes: [u8; 4] = [frame[8], frame[9], frame[10], frame[11]];
     let expected = compute_auth_tag(secret, &short_id, &ts_bytes);
 
     if frame[12..28] != expected {
-        return None;
+        return Err(TunnelAuthReject::BadTag);
     }
 
-    Some(short_id)
+    Ok(short_id)
+}
+
+pub fn verify_tunnel_auth(
+    frame: &[u8; TUNNEL_AUTH_LEN],
+    secret: &[u8; 32],
+    allowed_short_ids: &[[u8; 8]],
+    max_time_diff: u64,
+) -> Option<[u8; 8]> {
+    verify_tunnel_auth_detailed(frame, secret, allowed_short_ids, max_time_diff).ok()
 }
 
 /// Send the auth frame + read the 2-byte ACK inside a TLS tunnel.
@@ -252,8 +359,9 @@ pub async fn send_tunnel_auth<S: AsyncWrite + AsyncRead + Unpin>(
     stream: &mut S,
     secret: &[u8; 32],
     short_id: &[u8; 8],
+    time_offset_secs: i64,
 ) -> Result<()> {
-    let frame = build_tunnel_auth(secret, short_id);
+    let frame = build_tunnel_auth_with_offset(secret, short_id, time_offset_secs);
     stream.write_all(&frame).await.context("send auth frame")?;
     let mut ack = [0u8; 2];
     stream.read_exact(&mut ack).await.context("read auth ACK")?;
@@ -276,13 +384,13 @@ pub async fn recv_and_verify_tunnel_auth<S: AsyncRead + AsyncWrite + Unpin>(
         .read_exact(&mut frame)
         .await
         .context("read auth frame")?;
-    match verify_tunnel_auth(&frame, secret, allowed_short_ids, max_time_diff) {
-        Some(short_id) => {
+    match verify_tunnel_auth_detailed(&frame, secret, allowed_short_ids, max_time_diff) {
+        Ok(short_id) => {
             stream.write_all(&TUNNEL_AUTH_OK).await?;
             Ok(short_id)
         }
-        None => {
-            bail!("Reality: невалидная аутентификация");
+        Err(e) => {
+            bail!("Reality: {}", e);
         }
     }
 }
