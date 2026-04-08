@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} --bins
+
+      - name: Package
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          TARGET="${{ matrix.target }}"
+          STAGING="staging"
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING"
+
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "target/${TARGET}/release/socks6.exe" "$STAGING/"
+            cp "target/${TARGET}/release/socks6-client.exe" "$STAGING/"
+            ARCHIVE="socks6-${VERSION}-${TARGET}.zip"
+            powershell -NoProfile -Command "Compress-Archive -Path '${STAGING}/*' -DestinationPath '${ARCHIVE}' -Force"
+          else
+            cp "target/${TARGET}/release/socks6" "$STAGING/"
+            cp "target/${TARGET}/release/socks6-client" "$STAGING/"
+            ARCHIVE="socks6-${VERSION}-${TARGET}.tar.gz"
+            tar -C "$STAGING" -czvf "$ARCHIVE" socks6 socks6-client
+          fi
+
+          echo "asset=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: ${{ steps.pack.outputs.asset }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          merge-multiple: true
+          path: assets
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: assets/*
