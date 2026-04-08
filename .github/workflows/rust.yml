@@ -23,8 +23,6 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: macos-latest
             target: aarch64-apple-darwin
-          # - os: macos-13
-          #   target: x86_64-apple-darwin
 
     runs-on: ${{ matrix.os }}
 
@@ -83,4 +81,4 @@ jobs:
           generate_release_notes: true
           files: assets/*
         env:
-          GITHUB_TOKEN: ${{ secrets.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 }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
