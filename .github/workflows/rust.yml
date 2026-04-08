@@ -82,3 +82,5 @@ jobs:
         with:
           generate_release_notes: true
           files: assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.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 }}
