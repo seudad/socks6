@@ -194,5 +194,5 @@ sudo systemctl enable --now socks6 && sudo systemctl enable --now socks6-client
 
 > ### Ubuntu 22.04
 > ```
-> cd /opt/socks6 && curl -L https://github.com/seudad/socks6/releases/download/v2.>1.2/socks6-v2.1.2-x86_64-unknown-linux-gnu.tar.gz | tar zx 
+> cd /opt/socks6 && curl -fsSL 'https://github.com/seudad/socks6/releases/download/v2.1.2/socks6-v2.1.2-x86_64-unknown-linux-gnu.tar.gz' | tar xz 
 > ```

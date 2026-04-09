@@ -1,6 +1,0 @@
-# сервисы с жёсткой проверкой SNI
-apple.com
-icloud.com
-
-instagram.com
-facebook.com
