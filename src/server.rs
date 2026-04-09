@@ -1,11 +1,11 @@
 use crate::config::Config;
-use crate::{reality, relay, socks6};
+use crate::{reality, relay, socks6, udp_relay};
 use anyhow::{bail, Context, Result};
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::{timeout, Duration};
 use tokio_rustls::TlsAcceptor;
 
@@ -344,38 +344,54 @@ async fn handle_client<S>(
     config: Config,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     socks6::handshake(&mut client, &config).await?;
-    let target = socks6::read_connect(&mut client).await?;
-    tracing::info!(%target, "CONNECT");
+    let cmd = socks6::read_request(&mut client).await?;
 
-    let mut remote = match target.connect().await {
-        Ok(s) => s,
-        Err(e) => {
-            let reply = match e.kind() {
-                std::io::ErrorKind::ConnectionRefused => socks6::Reply::ConnectionRefused,
-                _ => socks6::Reply::HostUnreachable,
+    match cmd {
+        socks6::SocksCommand::Connect(target) => {
+            tracing::info!(%target, "CONNECT");
+
+            let mut remote = match target.connect().await {
+                Ok(s) => s,
+                Err(e) => {
+                    let reply = match e.kind() {
+                        std::io::ErrorKind::ConnectionRefused => socks6::Reply::ConnectionRefused,
+                        _ => socks6::Reply::HostUnreachable,
+                    };
+                    socks6::send_reply(&mut client, reply).await.ok();
+                    bail!("подключение к {target} не удалось: {e}");
+                }
             };
-            socks6::send_reply(&mut client, reply).await.ok();
-            bail!("подключение к {target} не удалось: {e}");
+            remote.set_nodelay(true)?;
+
+            let bind = remote.local_addr()?;
+            socks6::send_connect_ok(&mut client, bind).await?;
+
+            let sni = effective_sni_spoof(&config, &target);
+            if config.sni_spoof.is_some() && sni.is_none() && target.port() == 443 {
+                if let socks6::TargetAddr::Domain(host, _) = &target {
+                    tracing::info!(%peer, host = %host, "подмена SNI отключена (--sni-exclude)");
+                }
+            }
+
+            let (up, down) = relay::relay(&mut client, &mut remote, sni).await?;
+            tracing::info!(up, down, "релей завершён");
         }
-    };
-    remote.set_nodelay(true)?;
+        socks6::SocksCommand::UdpAssociate(_requested) => {
+            tracing::info!("UDP ASSOCIATE");
 
-    let bind = remote.local_addr()?;
-    socks6::send_connect_ok(&mut client, bind).await?;
+            let udp = UdpSocket::bind("0.0.0.0:0").await?;
+            let bind_addr = udp.local_addr()?;
+            tracing::debug!(udp_bind = %bind_addr, "UDP сокет привязан");
+            socks6::send_connect_ok(&mut client, bind_addr).await?;
 
-    let sni = effective_sni_spoof(&config, &target);
-    if config.sni_spoof.is_some() && sni.is_none() && target.port() == 443 {
-        if let socks6::TargetAddr::Domain(host, _) = &target {
-            tracing::info!(%peer, host = %host, "подмена SNI отключена (--sni-exclude)");
+            udp_relay::run_server_tunneled(client, udp).await?;
+            tracing::info!("UDP релей завершён");
         }
     }
 
-    let (up, down) = relay::relay(&mut client, &mut remote, sni).await?;
-
-    tracing::info!(up, down, "релей завершён");
     Ok(())
 }
 

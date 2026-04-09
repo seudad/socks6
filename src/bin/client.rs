@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_rustls::rustls;
@@ -279,6 +279,123 @@ async fn run(config: ClientConfig) -> Result<()> {
 
 // ── Per-connection handler ──────────────────────────────────────────────
 
+// ── Establish TLS + Reality tunnel to server ─────────────────────────────
+
+async fn establish_server_tunnel(
+    peer: SocketAddr,
+    config: &ClientConfig,
+    tls_config: Arc<rustls::ClientConfig>,
+    tls_slots: &Semaphore,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let _tls_slot = tls_slots
+        .acquire()
+        .await
+        .context("TLS: семафор закрыт")?;
+    tracing::debug!(%peer, "слот TLS к VPS взят");
+
+    let connector = TlsConnector::from(tls_config);
+    const MAX_TLS_HANDSHAKE_TRIES: u32 = 3;
+    const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+    const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(25);
+    let mut attempt: u32 = 0;
+    let mut tunnel = loop {
+        attempt += 1;
+        let tcp = match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(&config.server)).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "TCP к {} (нет SYN/ответа сервера или отказ)",
+                        config.server
+                    )
+                });
+            }
+            Err(_) => {
+                bail!(
+                    "TCP к {}: таймаут {} с. Проверьте IP/порт, ufw на VPS, доступ с Mac (ping/маршрут не обязателен для TCP), VPN на Mac",
+                    config.server,
+                    TCP_CONNECT_TIMEOUT.as_secs()
+                );
+            }
+        };
+        tcp.set_nodelay(true).ok();
+        let tcp_local = tcp.local_addr().ok();
+        let tcp_peer = tcp.peer_addr().ok();
+        tracing::info!(
+            %peer,
+            attempt,
+            target = %config.server,
+            ?tcp_local,
+            ?tcp_peer,
+            "TCP сессия открыта"
+        );
+        tracing::debug!(%peer, attempt, server = %config.server, "TCP до VPS установлен");
+
+        let name = rustls::pki_types::ServerName::try_from(config.server_name.clone())
+            .context("невалидный SNI")?;
+        tracing::debug!(%peer, sni = %config.server_name, "старт TLS ClientHello к VPS");
+        match timeout(TLS_HANDSHAKE_TIMEOUT, connector.connect(name, tcp)).await {
+            Ok(Ok(t)) => {
+                if attempt > 1 {
+                    tracing::debug!(%peer, attempt, "TLS: успех после повтора");
+                }
+                tracing::debug!(%peer, "TLS к VPS готов");
+                break t;
+            }
+            Ok(Err(e)) => {
+                let retriable = matches!(
+                    e.kind(),
+                    ErrorKind::UnexpectedEof
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                ) || e.to_string().to_lowercase().contains("eof");
+                if retriable && attempt < MAX_TLS_HANDSHAKE_TRIES {
+                    tracing::debug!(%peer, attempt, err = %e, "TLS: повтор handshake");
+                    tokio::time::sleep(Duration::from_millis(40 + 60 * attempt as u64)).await;
+                    continue;
+                }
+                tracing::warn!(
+                    %peer,
+                    err = %e,
+                    server = %config.server,
+                    sni = %config.server_name,
+                    "TLS к VPS не завершился после TCP (часто: SNI не в --reality-server-names → на VPS fallback на reality-dest и «чужой» TLS; или не тот порт/сервис). Смотрите логи socks6 на VPS: «SNI не в списке», «невалидный ClientHello»."
+                );
+                return Err(e).context("TLS хендшейк к VPS");
+            }
+            Err(_) => {
+                let msg = format!(
+                    "TLS к {}: таймаут {} с после TCP (нет ServerHello). На этом host:port слушает не ваш socks6/TLS, пакеты режутся, или процесс на VPS не тот",
+                    config.server,
+                    TLS_HANDSHAKE_TIMEOUT.as_secs()
+                );
+                tracing::warn!(%peer, %attempt, "{}", msg);
+                if attempt < MAX_TLS_HANDSHAKE_TRIES {
+                    tokio::time::sleep(Duration::from_millis(40 + 60 * attempt as u64)).await;
+                    continue;
+                }
+                bail!("{}", msg);
+            }
+        }
+    };
+
+    socks6::reality::send_tunnel_auth(
+        &mut tunnel,
+        &config.secret,
+        &config.short_id,
+        config.auth_time_offset_secs,
+    )
+    .await
+    .context(
+        "Reality аутентификация (см. лог VPS: расхождение времени → NTP или --auth-time-offset)",
+    )?;
+    tracing::debug!(%peer, "Reality auth к VPS OK");
+
+    Ok(tunnel)
+}
+
+// ── Per-connection handler ──────────────────────────────────────────────
+
 #[tracing::instrument(name = "proxy", skip_all, fields(%peer))]
 async fn handle_local_client(
     mut local: TcpStream,
@@ -287,135 +404,57 @@ async fn handle_local_client(
     tls_config: Arc<rustls::ClientConfig>,
     tls_slots: Arc<Semaphore>,
 ) -> Result<()> {
-    // 1. Accept SOCKS6 from local app
     local_socks6_handshake(&mut local).await?;
-    tracing::debug!(%peer, "шаг 1/6: с телефона SOCKS приветствие OK");
+    tracing::debug!(%peer, "SOCKS приветствие OK");
 
-    let (host, port) = local_socks6_read_connect(&mut local).await?;
-    tracing::info!(target = %format!("{host}:{port}"), "CONNECT");
-    tracing::debug!(%peer, host = %host, port, "шаг 2/6: запрошен CONNECT");
+    let cmd = local_socks6_read_request(&mut local).await?;
 
-    // 2. Ограничить параллельные TLS к одному серверу (иначе при бурстах — tls handshake eof).
-    let mut tunnel = {
-        let _tls_slot = tls_slots
-            .acquire()
-            .await
-            .context("TLS: семафор закрыт")?;
-        tracing::debug!(%peer, "шаг 3/6: слот TLS к VPS взят");
+    match cmd {
+        LocalSocksCommand::Connect { host, port } => {
+            tracing::info!(target = %format!("{host}:{port}"), "CONNECT");
 
-        let connector = TlsConnector::from(tls_config);
-        const MAX_TLS_HANDSHAKE_TRIES: u32 = 3;
-        const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-        const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(25);
-        let mut attempt: u32 = 0;
-        let mut tunnel = loop {
-            attempt += 1;
-            let tcp = match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(&config.server)).await {
-                Ok(Ok(t)) => t,
-                Ok(Err(e)) => {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "TCP к {} (нет SYN/ответа сервера или отказ)",
-                            config.server
-                        )
-                    });
-                }
-                Err(_) => {
-                    bail!(
-                        "TCP к {}: таймаут {} с. Проверьте IP/порт, ufw на VPS, доступ с Mac (ping/маршрут не обязателен для TCP), VPN на Mac",
-                        config.server,
-                        TCP_CONNECT_TIMEOUT.as_secs()
-                    );
-                }
+            let mut tunnel =
+                establish_server_tunnel(peer, &config, tls_config, &tls_slots).await?;
+
+            remote_socks6_connect(&mut tunnel, &host, port, config.auth.as_ref())
+                .await
+                .context("SOCKS5 CONNECT через туннель")?;
+            tracing::debug!(%peer, "на VPS удалённый CONNECT OK");
+
+            local_socks6_send_ok(&mut local).await?;
+            tracing::debug!(%peer, "ответ CONNECT отправлен, релей");
+
+            let (up, down) = tokio::io::copy_bidirectional(&mut local, &mut tunnel).await?;
+            tracing::info!(up, down, "релей завершён");
+        }
+        LocalSocksCommand::UdpAssociate => {
+            tracing::info!("UDP ASSOCIATE");
+
+            let bind_ip = if local.local_addr()?.ip().is_loopback() {
+                "127.0.0.1"
+            } else {
+                "0.0.0.0"
             };
-            tcp.set_nodelay(true).ok();
-            let tcp_local = tcp.local_addr().ok();
-            let tcp_peer = tcp.peer_addr().ok();
-            tracing::info!(
-                %peer,
-                attempt,
-                target = %config.server,
-                ?tcp_local,
-                ?tcp_peer,
-                "TCP сессия открыта: проверьте, что tcp_peer — ваш VPS:порт; если там другой IP — неверный аргумент -s или подмена в /etc/hosts"
-            );
-            tracing::debug!(%peer, attempt, server = %config.server, "шаг 4a: TCP до VPS установлен");
+            let local_udp = UdpSocket::bind(format!("{bind_ip}:0")).await?;
+            let udp_addr = local_udp.local_addr()?;
+            tracing::debug!(%peer, %udp_addr, "локальный UDP сокет привязан");
 
-            let name = rustls::pki_types::ServerName::try_from(config.server_name.clone())
-                .context("невалидный SNI")?;
-            tracing::debug!(%peer, sni = %config.server_name, "шаг 4a→4b: старт TLS ClientHello к VPS");
-            match timeout(TLS_HANDSHAKE_TIMEOUT, connector.connect(name, tcp)).await {
-                Ok(Ok(t)) => {
-                    if attempt > 1 {
-                        tracing::debug!(%peer, attempt, "TLS: успех после повтора");
-                    }
-                    tracing::debug!(%peer, "шаг 4b: TLS к VPS готов");
-                    break t;
-                }
-                Ok(Err(e)) => {
-                    let retriable = matches!(
-                        e.kind(),
-                        ErrorKind::UnexpectedEof
-                            | ErrorKind::ConnectionReset
-                            | ErrorKind::ConnectionAborted
-                    ) || e.to_string().to_lowercase().contains("eof");
-                    if retriable && attempt < MAX_TLS_HANDSHAKE_TRIES {
-                        tracing::debug!(%peer, attempt, err = %e, "TLS: повтор handshake");
-                        tokio::time::sleep(Duration::from_millis(40 + 60 * attempt as u64)).await;
-                        continue;
-                    }
-                    tracing::warn!(
-                        %peer,
-                        err = %e,
-                        server = %config.server,
-                        sni = %config.server_name,
-                        "TLS к VPS не завершился после TCP (часто: SNI не в --reality-server-names → на VPS fallback на reality-dest и «чужой» TLS; или не тот порт/сервис). Смотрите логи socks6 на VPS: «SNI не в списке», «невалидный ClientHello»."
-                    );
-                    return Err(e).context("TLS хендшейк к VPS");
-                }
-                Err(_) => {
-                    let msg = format!(
-                        "TLS к {}: таймаут {} с после TCP (нет ServerHello). На этом host:port слушает не ваш socks6/TLS, пакеты режутся, или процесс на VPS не тот",
-                        config.server,
-                        TLS_HANDSHAKE_TIMEOUT.as_secs()
-                    );
-                    tracing::warn!(%peer, %attempt, "{}", msg);
-                    if attempt < MAX_TLS_HANDSHAKE_TRIES {
-                        tokio::time::sleep(Duration::from_millis(40 + 60 * attempt as u64)).await;
-                        continue;
-                    }
-                    bail!("{}", msg);
-                }
-            }
-        };
+            let mut tunnel =
+                establish_server_tunnel(peer, &config, tls_config, &tls_slots).await?;
 
-        socks6::reality::send_tunnel_auth(
-            &mut tunnel,
-            &config.secret,
-            &config.short_id,
-            config.auth_time_offset_secs,
-        )
-        .await
-        .context(
-            "Reality аутентификация (см. лог VPS: расхождение времени → NTP или --auth-time-offset)",
-        )?;
-        tracing::debug!(%peer, "шаг 5/6: Reality auth к VPS OK");
+            remote_socks6_udp_associate(&mut tunnel, config.auth.as_ref())
+                .await
+                .context("UDP ASSOCIATE через туннель")?;
+            tracing::debug!(%peer, "на VPS UDP ASSOCIATE OK");
 
-        remote_socks6_connect(&mut tunnel, &host, port, config.auth.as_ref())
-            .await
-            .context("SOCKS6 через туннель")?;
-        tracing::debug!(%peer, "шаг 6/6: на VPS удалённый CONNECT OK");
+            local_socks6_send_ok_addr(&mut local, udp_addr).await?;
+            tracing::debug!(%peer, "ответ UDP ASSOCIATE отправлен");
 
-        tunnel
-    };
+            socks6::udp_relay::run_client_tunneled(tunnel, local_udp, local).await?;
+            tracing::info!("UDP релей завершён");
+        }
+    }
 
-    // 5. Send CONNECT OK to local app
-    local_socks6_send_ok(&mut local).await?;
-    tracing::debug!(%peer, "ответ CONNECT отправлен телефону, релей");
-
-    // 6. Bidirectional relay
-    let (up, down) = tokio::io::copy_bidirectional(&mut local, &mut tunnel).await?;
-    tracing::info!(up, down, "релей завершён");
     Ok(())
 }
 
@@ -449,34 +488,52 @@ async fn local_socks6_handshake(stream: &mut TcpStream) -> Result<()> {
     Ok(())
 }
 
-async fn local_socks6_read_connect(stream: &mut TcpStream) -> Result<(String, u16)> {
+enum LocalSocksCommand {
+    Connect { host: String, port: u16 },
+    UdpAssociate,
+}
+
+async fn local_socks6_read_request(stream: &mut TcpStream) -> Result<LocalSocksCommand> {
     let mut hdr = [0u8; 4];
     stream.read_exact(&mut hdr).await?;
-    if hdr[0] != 0x05 || hdr[1] != 0x01 {
-        bail!("не SOCKS6 CONNECT: ver={:#x} cmd={:#x}", hdr[0], hdr[1]);
+    if hdr[0] != 0x05 {
+        bail!("не SOCKS5: ver={:#x}", hdr[0]);
     }
-    match hdr[3] {
+
+    let cmd = hdr[1];
+    if cmd != 0x01 && cmd != 0x03 {
+        stream.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.ok();
+        bail!("команда {:#x} не поддерживается", cmd);
+    }
+
+    let (host, port) = match hdr[3] {
         0x01 => {
             let mut ip = [0u8; 4];
             stream.read_exact(&mut ip).await?;
             let port = stream.read_u16().await?;
-            Ok((format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]), port))
+            (format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]), port)
         }
         0x03 => {
             let len = stream.read_u8().await? as usize;
             let mut domain = vec![0u8; len];
             stream.read_exact(&mut domain).await?;
             let port = stream.read_u16().await?;
-            Ok((String::from_utf8(domain).context("невалидный домен")?, port))
+            (String::from_utf8(domain).context("невалидный домен")?, port)
         }
         0x04 => {
             let mut ip = [0u8; 16];
             stream.read_exact(&mut ip).await?;
             let port = stream.read_u16().await?;
             let addr = std::net::Ipv6Addr::from(ip);
-            Ok((format!("[{addr}]"), port))
+            (format!("[{addr}]"), port)
         }
         other => bail!("неподдерживаемый ATYP: {other:#x}"),
+    };
+
+    match cmd {
+        0x01 => Ok(LocalSocksCommand::Connect { host, port }),
+        0x03 => Ok(LocalSocksCommand::UdpAssociate),
+        _ => unreachable!(),
     }
 }
 
@@ -484,7 +541,27 @@ async fn local_socks6_send_ok(stream: &mut TcpStream) -> Result<()> {
     stream
         .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await?;
-    stream.flush().await.context("flush SOCKS6 CONNECT OK")?;
+    stream.flush().await.context("flush SOCKS5 CONNECT OK")?;
+    Ok(())
+}
+
+async fn local_socks6_send_ok_addr(stream: &mut TcpStream, addr: SocketAddr) -> Result<()> {
+    let mut buf = Vec::with_capacity(22);
+    buf.extend_from_slice(&[0x05, 0x00, 0x00]);
+    match addr {
+        SocketAddr::V4(a) => {
+            buf.push(0x01);
+            buf.extend_from_slice(&a.ip().octets());
+            buf.extend_from_slice(&a.port().to_be_bytes());
+        }
+        SocketAddr::V6(a) => {
+            buf.push(0x04);
+            buf.extend_from_slice(&a.ip().octets());
+            buf.extend_from_slice(&a.port().to_be_bytes());
+        }
+    }
+    stream.write_all(&buf).await?;
+    stream.flush().await.context("flush SOCKS5 UDP ASSOCIATE OK")?;
     Ok(())
 }
 
@@ -580,6 +657,79 @@ where
             stream.read_exact(&mut skip).await?;
         }
         atyp => bail!("SOCKS CONNECT OK: неизвестный ATYP в ответе сервера: {atyp:#x}"),
+    }
+
+    Ok(())
+}
+
+// ── Remote SOCKS5 UDP ASSOCIATE (through tunnel) ─────────────────────────
+
+async fn remote_socks6_udp_associate<S>(
+    stream: &mut S,
+    auth: Option<&(String, String)>,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    if auth.is_some() {
+        stream.write_all(&[0x05, 0x01, 0x02]).await?;
+    } else {
+        stream.write_all(&[0x05, 0x01, 0x00]).await?;
+    }
+
+    let mut choice = [0u8; 2];
+    stream.read_exact(&mut choice).await?;
+    if choice[0] != 0x05 {
+        bail!("сервер не SOCKS5: {:#x}", choice[0]);
+    }
+
+    match choice[1] {
+        0x00 => {}
+        0x02 => {
+            let (user, pass) = auth.context("сервер требует авторизацию")?;
+            let mut msg = Vec::with_capacity(3 + user.len() + pass.len());
+            msg.push(0x01);
+            msg.push(user.len() as u8);
+            msg.extend_from_slice(user.as_bytes());
+            msg.push(pass.len() as u8);
+            msg.extend_from_slice(pass.as_bytes());
+            stream.write_all(&msg).await?;
+            let mut resp = [0u8; 2];
+            stream.read_exact(&mut resp).await?;
+            if resp[1] != 0x00 {
+                bail!("авторизация на сервере не пройдена");
+            }
+        }
+        0xFF => bail!("сервер отклонил методы аутентификации"),
+        other => bail!("неподдерживаемый метод: {other:#x}"),
+    }
+
+    stream.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+
+    let mut reply = [0u8; 4];
+    stream.read_exact(&mut reply).await?;
+    if reply[0] != 0x05 {
+        bail!("невалидный SOCKS5 ответ: {:#x}", reply[0]);
+    }
+    if reply[1] != 0x00 {
+        bail!("сервер отклонил UDP ASSOCIATE: {:#x}", reply[1]);
+    }
+
+    match reply[3] {
+        0x01 => {
+            let mut skip = [0u8; 6];
+            stream.read_exact(&mut skip).await?;
+        }
+        0x03 => {
+            let len = stream.read_u8().await? as usize;
+            let mut skip = vec![0u8; len + 2];
+            stream.read_exact(&mut skip).await?;
+        }
+        0x04 => {
+            let mut skip = [0u8; 18];
+            stream.read_exact(&mut skip).await?;
+        }
+        atyp => bail!("UDP ASSOCIATE OK: неизвестный ATYP: {atyp:#x}"),
     }
 
     Ok(())

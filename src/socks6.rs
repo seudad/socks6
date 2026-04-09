@@ -10,6 +10,7 @@ const AUTH_NONE: u8 = 0x00;
 const AUTH_USERPASS: u8 = 0x02;
 const AUTH_REJECT: u8 = 0xFF;
 const CMD_CONNECT: u8 = 0x01;
+const CMD_UDP_ASSOCIATE: u8 = 0x03;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
@@ -28,6 +29,11 @@ pub enum Reply {
     ConnectionRefused = 0x05,
     CommandNotSupported = 0x07,
     AddrTypeNotSupported = 0x08,
+}
+
+pub enum SocksCommand {
+    Connect(TargetAddr),
+    UdpAssociate(TargetAddr),
 }
 
 pub enum TargetAddr {
@@ -56,6 +62,18 @@ impl TargetAddr {
         match self {
             Self::Ip(a) => TcpStream::connect(a).await,
             Self::Domain(h, p) => TcpStream::connect((h.as_str(), *p)).await,
+        }
+    }
+
+    pub async fn resolve(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Self::Ip(a) => Ok(*a),
+            Self::Domain(h, p) => tokio::net::lookup_host(format!("{h}:{p}"))
+                .await?
+                .next()
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "DNS: не удалось разрешить адрес")
+                }),
         }
     }
 }
@@ -132,20 +150,22 @@ async fn auth_userpass<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-// ── CONNECT ──────────────────────────────────────────────────────────────
+// ── CONNECT / UDP ASSOCIATE ──────────────────────────────────────────────
 
-pub async fn read_connect<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn read_request<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
-) -> Result<TargetAddr> {
+) -> Result<SocksCommand> {
     let mut hdr = [0u8; 4];
     stream.read_exact(&mut hdr).await?;
 
     if hdr[0] != VER {
         bail!("неверная версия: {:#x}", hdr[0]);
     }
-    if hdr[1] != CMD_CONNECT {
+
+    let cmd = hdr[1];
+    if cmd != CMD_CONNECT && cmd != CMD_UDP_ASSOCIATE {
         send_reply(stream, Reply::CommandNotSupported).await.ok();
-        bail!("команда {:#x} не поддерживается", hdr[1]);
+        bail!("команда {:#x} не поддерживается", cmd);
     }
 
     let target = match hdr[3] {
@@ -177,7 +197,11 @@ pub async fn read_connect<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
 
-    Ok(target)
+    match cmd {
+        CMD_CONNECT => Ok(SocksCommand::Connect(target)),
+        CMD_UDP_ASSOCIATE => Ok(SocksCommand::UdpAssociate(target)),
+        _ => unreachable!(),
+    }
 }
 
 // ── replies ──────────────────────────────────────────────────────────────
@@ -208,4 +232,70 @@ pub async fn send_connect_ok<S: AsyncWrite + Unpin>(
     }
     stream.write_all(&buf).await?;
     Ok(())
+}
+
+// ── SOCKS5 UDP datagram header (RFC 1928 §7) ────────────────────────────
+
+/// Parse a SOCKS5 UDP datagram header from `buf`.
+/// Returns `(frag, target, header_len)`.
+pub fn parse_udp_header(buf: &[u8]) -> Result<(u8, TargetAddr, usize)> {
+    if buf.len() < 4 {
+        bail!("UDP заголовок слишком короткий");
+    }
+    let frag = buf[2];
+    match buf[3] {
+        ATYP_IPV4 => {
+            if buf.len() < 10 {
+                bail!("UDP заголовок слишком короткий для IPv4");
+            }
+            let ip = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+            let port = u16::from_be_bytes([buf[8], buf[9]]);
+            Ok((frag, TargetAddr::Ip((ip, port).into()), 10))
+        }
+        ATYP_DOMAIN => {
+            if buf.len() < 5 {
+                bail!("UDP заголовок слишком короткий для домена");
+            }
+            let dlen = buf[4] as usize;
+            let end = 7 + dlen;
+            if buf.len() < end {
+                bail!("UDP заголовок слишком короткий для доменного имени");
+            }
+            let domain = String::from_utf8(buf[5..5 + dlen].to_vec())
+                .context("невалидное доменное имя в UDP заголовке")?;
+            let port = u16::from_be_bytes([buf[5 + dlen], buf[5 + dlen + 1]]);
+            Ok((frag, TargetAddr::Domain(domain, port), end))
+        }
+        ATYP_IPV6 => {
+            if buf.len() < 22 {
+                bail!("UDP заголовок слишком короткий для IPv6");
+            }
+            let mut ip_bytes = [0u8; 16];
+            ip_bytes.copy_from_slice(&buf[4..20]);
+            let ip = Ipv6Addr::from(ip_bytes);
+            let port = u16::from_be_bytes([buf[20], buf[21]]);
+            Ok((frag, TargetAddr::Ip((ip, port).into()), 22))
+        }
+        other => bail!("неподдерживаемый ATYP в UDP заголовке: {other:#x}"),
+    }
+}
+
+/// Build a SOCKS5 UDP response header (RSV + FRAG + ATYP + ADDR + PORT).
+pub fn build_udp_response_header(frag: u8, src: SocketAddr) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(22);
+    buf.extend_from_slice(&[0x00, 0x00]);
+    buf.push(frag);
+    match src {
+        SocketAddr::V4(a) => {
+            buf.push(0x01);
+            buf.extend_from_slice(&a.ip().octets());
+            buf.extend_from_slice(&a.port().to_be_bytes());
+        }
+        SocketAddr::V6(a) => {
+            buf.push(0x04);
+            buf.extend_from_slice(&a.ip().octets());
+            buf.extend_from_slice(&a.port().to_be_bytes());
+        }
+    }
+    buf
 }

@@ -4,3 +4,4 @@ pub mod relay;
 pub mod server;
 pub mod sni;
 pub mod socks6;
+pub mod udp_relay;
