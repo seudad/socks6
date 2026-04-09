@@ -1,0 +1,12 @@
+target
+.git
+.github
+.cursor
+.idea
+.vscode
+.env
+.env.*
+certs
+debug
+systemd
+.DS_Store

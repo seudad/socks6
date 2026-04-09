@@ -189,6 +189,17 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now socks6 && sudo systemctl enable --now socks6-client
 ```
 
+### Docker
+
+В корне репозитория: `Dockerfile`, `docker-compose.yml`, скрипт `docker/entrypoint.sh` и пример переменных `docker/env.example`.
+
+1. Скопируйте `docker/env.example` в `.env` в корне и подставьте `REALITY_*`, `AUTH`, при необходимости `SOCKS6_SNI` и пути к сертификатам.
+2. Каталог с `fullchain.pem` и `privkey.pem`: по умолчанию `./certs` (или задайте `SOCKS6_CERT_DIR` в `.env`).
+3. Сборка и запуск: `docker compose up -d --build`
+4. Генерация ключей Reality без полного `.env`:  
+   `docker compose run --rm --entrypoint /usr/local/bin/socks6 socks6 --reality-generate-keys`
+
+Переменные `LISTEN`, `TLS_*`, `REALITY_*`, `AUTH`, `AUTH_FILE`, `SOCKS6_SNI`, `SNI_EXCLUDE_FILE`, `SOCKS6_TLS_FLEX`, `REALITY_MAX_TIME_DIFF`, `SOCKS6_EXTRA_ARGS`, `RUST_LOG` читает `docker/entrypoint.sh`. Дополнительный том для файла исключений SNI можно добавить в `docker-compose.yml` и указать `SNI_EXCLUDE_FILE=/config/sni-exclude.txt`.
 
 ### Загрузка бинарников
 

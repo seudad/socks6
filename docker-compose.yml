@@ -1,0 +1,22 @@
+# SOCKS6-сервер (TLS + Reality) в контейнере.
+#
+# 1) Скопируйте docker/env.example в .env и заполните секреты и пути.
+# 2) Положите fullchain.pem и privkey.pem в каталог certs/ (или задайте SOCKS6_CERT_DIR).
+# 3) Запуск: docker compose up -d --build
+#
+# Публикация порта: по умолчанию хост 443 -> контейнер 443.
+# Для внутреннего порта 8443 без root в образе задайте LISTEN=0.0.0.0:8443 и порты "443:8443".
+
+services:
+  socks6:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: socks6:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${SOCKS6_PUBLISH:-443}:443"
+    volumes:
+      - ${SOCKS6_CERT_DIR:-./certs}:/certs:ro
