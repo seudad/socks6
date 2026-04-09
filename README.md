@@ -192,7 +192,12 @@ sudo systemctl enable --now socks6 && sudo systemctl enable --now socks6-client
 
 ### Загрузка бинарников
 
-> ### Ubuntu 22.04
+> - #### Ubuntu 22.04
 > ```
 > cd /opt/socks6 && curl -fsSL 'https://github.com/seudad/socks6/releases/download/v2.1.2/socks6-v2.1.2-x86_64-unknown-linux-gnu.tar.gz' | tar xz 
+> ```
+>
+> - #### Windows
+> ```
+> curl -fsSL 'https://github.com/seudad/socks6/releases/download/v2.1.2/socks6-v2.1.2-x86_64-pc-windows-msvc.zip' | tar xz
 > ```
