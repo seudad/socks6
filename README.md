@@ -191,15 +191,26 @@ sudo systemctl enable --now socks6 && sudo systemctl enable --now socks6-client
 
 ### Docker
 
-В корне репозитория: `Dockerfile`, `docker-compose.yml`, скрипт `docker/entrypoint.sh` и пример переменных `docker/env.example`.
+В корне репозитория: `Dockerfile` (две стадии: **`server`** и **`client`**), `docker-compose.yml`, `docker/entrypoint.sh` (сервер), `docker/client-entrypoint.sh` (клиент), примеры `docker/env.example` и `docker/client.env.example`.
 
-1. Скопируйте `docker/env.example` в `.env` в корне и подставьте `REALITY_*`, `AUTH`, при необходимости `SOCKS6_SNI` и пути к сертификатам.
-2. Каталог с `fullchain.pem` и `privkey.pem`: по умолчанию `./certs` (или задайте `SOCKS6_CERT_DIR` в `.env`).
-3. Сборка и запуск: `docker compose up -d --build`
-4. Генерация ключей Reality без полного `.env`:  
+**Сервер**
+
+1. Скопируйте `docker/env.example` в `.env` и подставьте `REALITY_*`, `AUTH`, при необходимости `SOCKS6_SNI` и пути к сертификатам.
+2. Каталог с `fullchain.pem` и `privkey.pem`: по умолчанию `./certs` (или `SOCKS6_CERT_DIR` в `.env`).
+3. Запуск только сервера: `docker compose up -d --build`
+4. Генерация ключей Reality:  
    `docker compose run --rm --entrypoint /usr/local/bin/socks6 socks6 --reality-generate-keys`
 
-Переменные `LISTEN`, `TLS_*`, `REALITY_*`, `AUTH`, `AUTH_FILE`, `SOCKS6_SNI`, `SNI_EXCLUDE_FILE`, `SOCKS6_TLS_FLEX`, `REALITY_MAX_TIME_DIFF`, `SOCKS6_EXTRA_ARGS`, `RUST_LOG` читает `docker/entrypoint.sh`. Дополнительный том для файла исключений SNI можно добавить в `docker-compose.yml` и указать `SNI_EXCLUDE_FILE=/config/sni-exclude.txt`.
+Переменные для сервера читает `docker/entrypoint.sh` (`LISTEN`, `TLS_*`, `REALITY_*`, `AUTH`, `AUTH_FILE`, `SOCKS6_SNI`, `SNI_EXCLUDE_FILE`, `SOCKS6_TLS_FLEX`, `REALITY_MAX_TIME_DIFF`, `SOCKS6_EXTRA_ARGS`, `RUST_LOG`). Дополнительный том для SNI-exclude — в `docker-compose.yml`, путь в `SNI_EXCLUDE_FILE`.
+
+**Клиент** (`socks6-client` в контейнере)
+
+1. Скопируйте `docker/client.env.example` в `.env.client`.
+2. Укажите `CLIENT_SERVER` (на той же машине что и compose — `socks6:443`; с хоста или другой машины — `IP:443`), `CLIENT_SERVER_NAME`, `CLIENT_SECRET`, `CLIENT_SHORT_ID`, при необходимости `CLIENT_AUTH`.
+3. Запуск вместе с сервером: `docker compose --profile client up -d --build`  
+   Только клиент (образ уже есть): `docker compose --profile client up -d socks6-client`
+
+Локальный SOCKS5 слушает `CLIENT_LISTEN` (по умолчанию `0.0.0.0:1080`); на хосте порт задаётся `CLIENT_PUBLISH` (проброс `CLIENT_PUBLISH:1080`).
 
 ### Загрузка бинарников
 

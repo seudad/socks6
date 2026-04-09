@@ -1,17 +1,18 @@
-# SOCKS6-сервер (TLS + Reality) в контейнере.
+# SOCKS6-сервер и клиент в Docker.
 #
-# 1) Скопируйте docker/env.example в .env и заполните секреты и пути.
-# 2) Положите fullchain.pem и privkey.pem в каталог certs/ (или задайте SOCKS6_CERT_DIR).
-# 3) Запуск: docker compose up -d --build
+# Сервер: docker/env.example → .env, каталог certs/
+# Клиент: docker/client.env.example → .env.client
 #
-# Публикация порта: по умолчанию хост 443 -> контейнер 443.
-# Для внутреннего порта 8443 без root в образе задайте LISTEN=0.0.0.0:8443 и порты "443:8443".
+# Только сервер:        docker compose up -d --build
+# Сервер + клиент:      docker compose --profile client up -d --build
+# Только собрать образы docker compose build
 
 services:
   socks6:
     build:
       context: .
       dockerfile: Dockerfile
+      target: server
     image: socks6:local
     restart: unless-stopped
     env_file:
@@ -20,3 +21,17 @@ services:
       - "${SOCKS6_PUBLISH:-443}:443"
     volumes:
       - ${SOCKS6_CERT_DIR:-./certs}:/certs:ro
+
+  socks6-client:
+    profiles:
+      - client
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: client
+    image: socks6-client:local
+    restart: unless-stopped
+    env_file:
+      - .env.client
+    ports:
+      - "${CLIENT_PUBLISH:-1080}:1080"
