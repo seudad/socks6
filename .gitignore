@@ -9,3 +9,6 @@ server.crt
 server.key
 systemd/
 debug/
+certs/fullchain.pem
+certs/privkey.pem
+bin/

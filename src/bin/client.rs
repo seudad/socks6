@@ -418,7 +418,7 @@ async fn handle_local_client(
 
             remote_socks6_connect(&mut tunnel, &host, port, config.auth.as_ref())
                 .await
-                .context("SOCKS5 CONNECT через туннель")?;
+                .context("SOCKS6 CONNECT через туннель")?;
             tracing::debug!(%peer, "на VPS удалённый CONNECT OK");
 
             local_socks6_send_ok(&mut local).await?;
@@ -577,14 +577,14 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     if auth.is_some() {
-        stream.write_all(&[0x05, 0x01, 0x02]).await?;
+        stream.write_all(&[0x06, 0x01, 0x02]).await?;
     } else {
-        stream.write_all(&[0x05, 0x01, 0x00]).await?;
+        stream.write_all(&[0x06, 0x01, 0x00]).await?;
     }
 
     let mut choice = [0u8; 2];
     stream.read_exact(&mut choice).await?;
-    if choice[0] != 0x05 {
+    if choice[0] != 0x06 {
         bail!("сервер не SOCKS6: {:#x}", choice[0]);
     }
 
@@ -609,8 +609,8 @@ where
         other => bail!("неподдерживаемый метод: {other:#x}"),
     }
 
-    let mut req = Vec::with_capacity(4 + 1 + host.len() + 2);
-    req.extend_from_slice(&[0x05, 0x01, 0x00]);
+    let mut req = Vec::with_capacity(4 + 1 + host.len() + 4);
+    req.extend_from_slice(&[0x06, 0x01]);
 
     if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
         req.push(0x01);
@@ -631,18 +631,19 @@ where
         req.extend_from_slice(host.as_bytes());
     }
     req.extend_from_slice(&port.to_be_bytes());
+    req.extend_from_slice(&0u16.to_be_bytes());
     stream.write_all(&req).await?;
 
-    let mut reply = [0u8; 4];
+    let mut reply = [0u8; 3];
     stream.read_exact(&mut reply).await?;
-    if reply[0] != 0x05 {
+    if reply[0] != 0x06 {
         bail!("невалидный SOCKS6 ответ: {:#x}", reply[0]);
     }
     if reply[1] != 0x00 {
         bail!("сервер CONNECT отклонён: {:#x}", reply[1]);
     }
 
-    match reply[3] {
+    match reply[2] {
         0x01 => {
             let mut skip = [0u8; 6];
             stream.read_exact(&mut skip).await?;
@@ -656,7 +657,13 @@ where
             let mut skip = [0u8; 18];
             stream.read_exact(&mut skip).await?;
         }
-        atyp => bail!("SOCKS CONNECT OK: неизвестный ATYP в ответе сервера: {atyp:#x}"),
+        atyp => bail!("SOCKS6 CONNECT OK: неизвестный ATYP в ответе сервера: {atyp:#x}"),
+    }
+
+    let opts_len = stream.read_u16().await? as usize;
+    if opts_len > 0 {
+        let mut skip = vec![0u8; opts_len];
+        stream.read_exact(&mut skip).await?;
     }
 
     Ok(())
@@ -672,15 +679,15 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     if auth.is_some() {
-        stream.write_all(&[0x05, 0x01, 0x02]).await?;
+        stream.write_all(&[0x06, 0x01, 0x02]).await?;
     } else {
-        stream.write_all(&[0x05, 0x01, 0x00]).await?;
+        stream.write_all(&[0x06, 0x01, 0x00]).await?;
     }
 
     let mut choice = [0u8; 2];
     stream.read_exact(&mut choice).await?;
-    if choice[0] != 0x05 {
-        bail!("сервер не SOCKS5: {:#x}", choice[0]);
+    if choice[0] != 0x06 {
+        bail!("сервер не SOCKS6: {:#x}", choice[0]);
     }
 
     match choice[1] {
@@ -704,18 +711,18 @@ where
         other => bail!("неподдерживаемый метод: {other:#x}"),
     }
 
-    stream.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+    stream.write_all(&[0x06, 0x03, 0x01, 0, 0, 0, 0, 0, 0, 0, 0]).await?;
 
-    let mut reply = [0u8; 4];
+    let mut reply = [0u8; 3];
     stream.read_exact(&mut reply).await?;
-    if reply[0] != 0x05 {
-        bail!("невалидный SOCKS5 ответ: {:#x}", reply[0]);
+    if reply[0] != 0x06 {
+        bail!("невалидный SOCKS6 ответ: {:#x}", reply[0]);
     }
     if reply[1] != 0x00 {
         bail!("сервер отклонил UDP ASSOCIATE: {:#x}", reply[1]);
     }
 
-    match reply[3] {
+    match reply[2] {
         0x01 => {
             let mut skip = [0u8; 6];
             stream.read_exact(&mut skip).await?;
@@ -730,6 +737,12 @@ where
             stream.read_exact(&mut skip).await?;
         }
         atyp => bail!("UDP ASSOCIATE OK: неизвестный ATYP: {atyp:#x}"),
+    }
+
+    let opts_len = stream.read_u16().await? as usize;
+    if opts_len > 0 {
+        let mut skip = vec![0u8; opts_len];
+        stream.read_exact(&mut skip).await?;
     }
 
     Ok(())

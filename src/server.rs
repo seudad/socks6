@@ -298,7 +298,7 @@ async fn handle_tls_flex(
             return Ok(());
         }
     };
-    if first == 0x05 {
+    if first == 0x06 {
         tracing::info!(%peer, "SOCKS6 plaintext (--tls-flex)");
         handle_client(stream, peer, config).await
     } else {

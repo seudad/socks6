@@ -5,7 +5,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-const VER: u8 = 0x05;
+const VER: u8 = 0x06;
 const AUTH_NONE: u8 = 0x00;
 const AUTH_USERPASS: u8 = 0x02;
 const AUTH_REJECT: u8 = 0xFF;
@@ -155,7 +155,7 @@ async fn auth_userpass<S: AsyncRead + AsyncWrite + Unpin>(
 pub async fn read_request<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
 ) -> Result<SocksCommand> {
-    let mut hdr = [0u8; 4];
+    let mut hdr = [0u8; 3];
     stream.read_exact(&mut hdr).await?;
 
     if hdr[0] != VER {
@@ -168,7 +168,7 @@ pub async fn read_request<S: AsyncRead + AsyncWrite + Unpin>(
         bail!("команда {:#x} не поддерживается", cmd);
     }
 
-    let target = match hdr[3] {
+    let target = match hdr[2] {
         ATYP_IPV4 => {
             let mut ip = [0u8; 4];
             stream.read_exact(&mut ip).await?;
@@ -197,6 +197,12 @@ pub async fn read_request<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
 
+    let opts_len = stream.read_u16().await? as usize;
+    if opts_len > 0 {
+        let mut _opts = vec![0u8; opts_len];
+        stream.read_exact(&mut _opts).await?;
+    }
+
     match cmd {
         CMD_CONNECT => Ok(SocksCommand::Connect(target)),
         CMD_UDP_ASSOCIATE => Ok(SocksCommand::UdpAssociate(target)),
@@ -207,7 +213,7 @@ pub async fn read_request<S: AsyncRead + AsyncWrite + Unpin>(
 // ── replies ──────────────────────────────────────────────────────────────
 
 pub async fn send_reply<S: AsyncWrite + Unpin>(stream: &mut S, reply: Reply) -> Result<()> {
-    let buf = [VER, reply as u8, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
+    let buf = [VER, reply as u8, ATYP_IPV4, 0, 0, 0, 0, 0, 0, 0, 0];
     stream.write_all(&buf).await?;
     Ok(())
 }
@@ -216,8 +222,8 @@ pub async fn send_connect_ok<S: AsyncWrite + Unpin>(
     stream: &mut S,
     bind: SocketAddr,
 ) -> Result<()> {
-    let mut buf = Vec::with_capacity(22);
-    buf.extend_from_slice(&[VER, Reply::Succeeded as u8, 0x00]);
+    let mut buf = Vec::with_capacity(24);
+    buf.extend_from_slice(&[VER, Reply::Succeeded as u8]);
     match bind {
         SocketAddr::V4(a) => {
             buf.push(ATYP_IPV4);
@@ -230,6 +236,7 @@ pub async fn send_connect_ok<S: AsyncWrite + Unpin>(
             buf.extend_from_slice(&a.port().to_be_bytes());
         }
     }
+    buf.extend_from_slice(&0u16.to_be_bytes());
     stream.write_all(&buf).await?;
     Ok(())
 }
@@ -280,7 +287,7 @@ pub fn parse_udp_header(buf: &[u8]) -> Result<(u8, TargetAddr, usize)> {
     }
 }
 
-/// Build a SOCKS5 UDP response header (RSV + FRAG + ATYP + ADDR + PORT).
+/// Build a SOCKS6 UDP response header (RSV + FRAG + ATYP + ADDR + PORT).
 pub fn build_udp_response_header(frag: u8, src: SocketAddr) -> Vec<u8> {
     let mut buf = Vec::with_capacity(22);
     buf.extend_from_slice(&[0x00, 0x00]);
@@ -298,4 +305,321 @@ pub fn build_udp_response_header(frag: u8, src: SocketAddr) -> Vec<u8> {
         }
     }
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_config() -> Config {
+        Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            users: Arc::new(HashMap::new()),
+            sni_spoof: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_flex: false,
+            sni_exclude: vec![],
+            reality_dest: None,
+            reality_secret: None,
+            reality_short_ids: vec![],
+            reality_server_names: vec![],
+            reality_max_time_diff: 3600,
+        }
+    }
+
+    fn test_config_with_auth(user: &str, pass: &str) -> Config {
+        let mut cfg = test_config();
+        let mut users = HashMap::new();
+        users.insert(user.to_owned(), pass.to_owned());
+        cfg.users = Arc::new(users);
+        cfg
+    }
+
+    // ── Handshake ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn handshake_no_auth() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let config = test_config();
+
+        let client_task = tokio::spawn(async move {
+            client.write_all(&[0x06, 0x01, 0x00]).await.unwrap();
+            let mut choice = [0u8; 2];
+            client.read_exact(&mut choice).await.unwrap();
+            assert_eq!(choice, [0x06, 0x00]);
+        });
+
+        handshake(&mut server, &config).await.unwrap();
+        client_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handshake_with_auth() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let config = test_config_with_auth("alice", "secret");
+
+        let client_task = tokio::spawn(async move {
+            client.write_all(&[0x06, 0x01, 0x02]).await.unwrap();
+            let mut choice = [0u8; 2];
+            client.read_exact(&mut choice).await.unwrap();
+            assert_eq!(choice, [0x06, 0x02]);
+            #[rustfmt::skip]
+            let msg: &[u8] = &[
+                0x01,
+                0x05, b'a', b'l', b'i', b'c', b'e',
+                0x06, b's', b'e', b'c', b'r', b'e', b't',
+            ];
+            client.write_all(msg).await.unwrap();
+            let mut resp = [0u8; 2];
+            client.read_exact(&mut resp).await.unwrap();
+            assert_eq!(resp, [0x01, 0x00]);
+        });
+
+        handshake(&mut server, &config).await.unwrap();
+        client_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_no_suitable_method() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let config = test_config_with_auth("alice", "secret");
+
+        let client_task = tokio::spawn(async move {
+            client.write_all(&[0x06, 0x01, 0x00]).await.unwrap();
+            let mut choice = [0u8; 2];
+            client.read_exact(&mut choice).await.unwrap();
+            assert_eq!(choice[1], 0xFF);
+        });
+
+        let result = handshake(&mut server, &config).await;
+        assert!(result.is_err());
+        client_task.await.unwrap();
+    }
+
+    // ── Request parsing ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn request_connect_domain() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+
+        let client_task = tokio::spawn(async move {
+            let mut req = vec![0x06, 0x01, 0x03];
+            let domain = b"example.com";
+            req.push(domain.len() as u8);
+            req.extend_from_slice(domain);
+            req.extend_from_slice(&80u16.to_be_bytes());
+            req.extend_from_slice(&0u16.to_be_bytes());
+            client.write_all(&req).await.unwrap();
+        });
+
+        let cmd = read_request(&mut server).await.unwrap();
+        match cmd {
+            SocksCommand::Connect(TargetAddr::Domain(host, port)) => {
+                assert_eq!(host, "example.com");
+                assert_eq!(port, 80);
+            }
+            _ => panic!("expected Connect with domain"),
+        }
+        client_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_connect_ipv4() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+
+        let client_task = tokio::spawn(async move {
+            #[rustfmt::skip]
+            let req: &[u8] = &[
+                0x06, 0x01, 0x01,
+                127, 0, 0, 1,
+                0x00, 0x50,
+                0x00, 0x00,
+            ];
+            client.write_all(req).await.unwrap();
+        });
+
+        let cmd = read_request(&mut server).await.unwrap();
+        match cmd {
+            SocksCommand::Connect(TargetAddr::Ip(addr)) => {
+                assert_eq!(addr.to_string(), "127.0.0.1:80");
+            }
+            _ => panic!("expected Connect with IPv4"),
+        }
+        client_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_connect_ipv6() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+
+        let client_task = tokio::spawn(async move {
+            let mut req = vec![0x06, 0x01, 0x04];
+            req.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+            req.extend_from_slice(&443u16.to_be_bytes());
+            req.extend_from_slice(&0u16.to_be_bytes());
+            client.write_all(&req).await.unwrap();
+        });
+
+        let cmd = read_request(&mut server).await.unwrap();
+        match cmd {
+            SocksCommand::Connect(TargetAddr::Ip(addr)) => {
+                assert_eq!(addr.to_string(), "[::1]:443");
+            }
+            _ => panic!("expected Connect with IPv6"),
+        }
+        client_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_udp_associate() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+
+        let client_task = tokio::spawn(async move {
+            #[rustfmt::skip]
+            let req: &[u8] = &[
+                0x06, 0x03, 0x01,
+                0, 0, 0, 0,
+                0x00, 0x00,
+                0x00, 0x00,
+            ];
+            client.write_all(req).await.unwrap();
+        });
+
+        let cmd = read_request(&mut server).await.unwrap();
+        assert!(matches!(cmd, SocksCommand::UdpAssociate(_)));
+        client_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_with_options() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+
+        let client_task = tokio::spawn(async move {
+            let mut req = vec![0x06, 0x01, 0x03];
+            let domain = b"test.io";
+            req.push(domain.len() as u8);
+            req.extend_from_slice(domain);
+            req.extend_from_slice(&443u16.to_be_bytes());
+            // TLV option: type=0x0001 (Padding), length=4, value=0x00000000
+            req.extend_from_slice(&8u16.to_be_bytes()); // OPTLEN=8
+            req.extend_from_slice(&1u16.to_be_bytes()); // TYPE
+            req.extend_from_slice(&4u16.to_be_bytes()); // LENGTH
+            req.extend_from_slice(&[0x00; 4]);          // VALUE
+            client.write_all(&req).await.unwrap();
+        });
+
+        let cmd = read_request(&mut server).await.unwrap();
+        match cmd {
+            SocksCommand::Connect(TargetAddr::Domain(host, port)) => {
+                assert_eq!(host, "test.io");
+                assert_eq!(port, 443);
+            }
+            _ => panic!("expected Connect with domain"),
+        }
+        client_task.await.unwrap();
+    }
+
+    // ── Reply building ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn reply_connect_ok_v4() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let bind: SocketAddr = "192.168.1.1:8080".parse().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            send_connect_ok(&mut server, bind).await.unwrap();
+        });
+
+        // VER(1) + REP(1) + ATYP(1) + IPv4(4) + PORT(2) + OPTLEN(2) = 11
+        let mut buf = [0u8; 11];
+        client.read_exact(&mut buf).await.unwrap();
+
+        assert_eq!(buf[0], 0x06);
+        assert_eq!(buf[1], 0x00);
+        assert_eq!(buf[2], 0x01);
+        assert_eq!(&buf[3..7], &[192, 168, 1, 1]);
+        assert_eq!(&buf[7..9], &8080u16.to_be_bytes());
+        assert_eq!(&buf[9..11], &[0, 0]);
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reply_connect_ok_v6() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let bind: SocketAddr = "[::1]:9090".parse().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            send_connect_ok(&mut server, bind).await.unwrap();
+        });
+
+        // VER(1) + REP(1) + ATYP(1) + IPv6(16) + PORT(2) + OPTLEN(2) = 23
+        let mut buf = [0u8; 23];
+        client.read_exact(&mut buf).await.unwrap();
+
+        assert_eq!(buf[0], 0x06);
+        assert_eq!(buf[1], 0x00);
+        assert_eq!(buf[2], 0x04);
+        assert_eq!(&buf[19..21], &9090u16.to_be_bytes());
+        assert_eq!(&buf[21..23], &[0, 0]);
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reply_error() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+
+        let server_task = tokio::spawn(async move {
+            send_reply(&mut server, Reply::ConnectionRefused).await.unwrap();
+        });
+
+        let mut buf = [0u8; 11];
+        client.read_exact(&mut buf).await.unwrap();
+
+        assert_eq!(buf[0], 0x06);
+        assert_eq!(buf[1], Reply::ConnectionRefused as u8);
+        assert_eq!(buf[2], 0x01);
+        assert_eq!(&buf[3..7], &[0, 0, 0, 0]);
+        assert_eq!(&buf[7..9], &[0, 0]);
+        assert_eq!(&buf[9..11], &[0, 0]);
+
+        server_task.await.unwrap();
+    }
+
+    // ── UDP header ───────────────────────────────────────────────────
+
+    #[test]
+    fn udp_header_parse_ipv4() {
+        let buf = [0x00, 0x00, 0x00, 0x01, 8, 8, 8, 8, 0x00, 0x35, 0xAA, 0xBB];
+        let (frag, target, hdr_len) = parse_udp_header(&buf).unwrap();
+        assert_eq!(frag, 0);
+        assert_eq!(hdr_len, 10);
+        assert_eq!(target.to_string(), "8.8.8.8:53");
+    }
+
+    #[test]
+    fn udp_header_roundtrip_v4() {
+        let src: SocketAddr = "1.2.3.4:5678".parse().unwrap();
+        let hdr = build_udp_response_header(0, src);
+        let (frag, target, len) = parse_udp_header(&hdr).unwrap();
+        assert_eq!(frag, 0);
+        assert_eq!(len, hdr.len());
+        assert_eq!(target.to_string(), "1.2.3.4:5678");
+    }
+
+    #[test]
+    fn udp_header_roundtrip_v6() {
+        let src: SocketAddr = "[::1]:4321".parse().unwrap();
+        let hdr = build_udp_response_header(0, src);
+        let (frag, target, len) = parse_udp_header(&hdr).unwrap();
+        assert_eq!(frag, 0);
+        assert_eq!(len, hdr.len());
+        assert_eq!(target.to_string(), "[::1]:4321");
+    }
 }
